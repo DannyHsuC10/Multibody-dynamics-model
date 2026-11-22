@@ -221,3 +221,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated multibody simulation reports and plots
+/Multibody_dynamics/output/*.csv
+/Multibody_dynamics/output/*.png
+/Inverse_dynamics_optimization/Model_Analysis/output/*.csv
+/Inverse_dynamics_optimization/Model_Analysis/output/*.txt
+/Inverse_dynamics_optimization/Model_Analysis/figures/*.png
+
+# Generated optimization plots and CMA-ES logs
+/Inverse_dynamics_optimization/Optimization/figures/*.png
+outcmaes/

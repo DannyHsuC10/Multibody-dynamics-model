@@ -15,6 +15,11 @@ MAX_INTEGRATION_STEP = 1 / 240
 MAX_STEPS = 12_000
 
 
+def ramp_force(time, force, duration):
+    phase = min(max(time / duration, 0.), 1.)
+    return force * phase**3 * (10. - phase * (15. - 6. * phase))
+
+
 def road_profile(time, amplitude, width):
     """Height and vertical road velocity of one smooth pulse in SI units."""
     if not 0. < time < width:

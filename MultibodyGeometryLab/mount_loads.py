@@ -21,14 +21,16 @@ class ChassisMountLoads:
 
 def compute_mount_loads(model: DynamicsModel, result: VehicleResult, dampers: dict[str, DamperResult],
                         body_acceleration: float, *, rotation: np.ndarray | None = None,
-                        wheel_accelerations: dict[str, np.ndarray] | None = None) -> dict[str, ChassisMountLoads]:
+                        wheel_accelerations: dict[str, np.ndarray] | None = None,
+                        tire_forces_y: dict[str, float] | None = None) -> dict[str, ChassisMountLoads]:
     """Use constrained point dynamics to recover A-arm, rack and damper forces.
 
     When supplied, rotation maps chassis axes to ground axes and each wheel
     acceleration is the absolute hub acceleration in ground axes. Otherwise
     body_acceleration describes a vertical chassis translation added to the
     relative hub acceleration. The returned reaction vectors use ground axes.
-    Unsprung mass is concentrated at each wheel center.
+    Lateral tire forces, when supplied, are ground-Y forces at the equivalent
+    hub. Unsprung mass is concentrated at each wheel center.
     """
     rotation = np.eye(3) if rotation is None else np.asarray(rotation, dtype=float)
     ground_z_in_chassis = rotation[2]
@@ -51,6 +53,8 @@ def compute_mount_loads(model: DynamicsModel, result: VehicleResult, dampers: di
             vertical_acceleration = model.gravity
         required[WHEEL] = (spec.mass * hub_acceleration
                            + (spec.mass * vertical_acceleration - damper.tire_force) * ground_z_in_chassis)
+        if tire_forces_y is not None:
+            required[WHEEL] -= tire_forces_y[name] * rotation[1]
         elastic = elastic_node_forces(model, name, pose, damper)
         if name in transfer:
             elastic[:EXTERNAL_INDEX] += transfer[name]

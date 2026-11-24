@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from ._geometry_support.hardpoints import CORNERS
-from .dynamics_settings import HEAVE_LIMITS, SIMULATION_LIMITS, validate_heave
+from .dynamics_settings import HEAVE_LIMITS, LATERAL_LIMITS, SIMULATION_LIMITS, validate_heave, validate_lateral
 
 
 TARGET_LABELS = {**dict(zip(CORNERS, CORNERS)), "all": "四輪"}
@@ -49,22 +49,29 @@ class RoadEditor(ttk.Frame):
             raise ValueError("路面擾動需要有效的輪位、高度及時間。") from error
 
 
-class HeaveEditor(ttk.Frame):
+class _CGForceEditor(ttk.Frame):
+    limits = HEAVE_LIMITS
+    validate = staticmethod(validate_heave)
+    description = "平坦地面 · 車身只沿 Z 軸移動"
+    directions = "正值向下施力，負值向上。"
+    note = "車身質量採車輛總質量扣除四輪輪端質量。"
+    button_label = "模擬重心 Heave"
+
     def __init__(self, parent, mark_dirty, start):
         super().__init__(parent, padding=10)
-        ttk.Label(self, text="平坦地面 · 車身只沿 Z 軸移動").pack(anchor="w")
+        ttk.Label(self, text=self.description).pack(anchor="w")
         inputs = ttk.Frame(self)
         inputs.pack(fill="x", pady=(8, 6))
         self.fields = {}
-        for row, (name, (label, _, _)) in enumerate(HEAVE_LIMITS.items()):
+        for row, (name, (label, _, _)) in enumerate(self.limits.items()):
             variable = self.fields[name] = tk.StringVar(self)
             variable.trace_add("write", mark_dirty)
             add_entry(inputs, row, label, variable)
-        ttk.Label(self, text="正值向下施力，負值向上。外力在上升時間內平滑增加，之後維持。",
+        ttk.Label(self, text=self.directions + "外力在上升時間內平滑增加，之後維持。",
                   wraplength=310).pack(anchor="w", pady=(2, 7))
-        ttk.Label(self, text="車身質量採車輛總質量扣除四輪輪端質量。",
+        ttk.Label(self, text=self.note,
                   wraplength=310).pack(anchor="w", pady=(0, 8))
-        self.start_button = ttk.Button(self, text="模擬重心 Heave", command=start)
+        self.start_button = ttk.Button(self, text=self.button_label, command=start)
         self.start_button.pack(fill="x")
 
     def populate(self, settings):
@@ -76,4 +83,17 @@ class HeaveEditor(ttk.Frame):
             parameters = {name: float(variable.get()) for name, variable in self.fields.items()}
         except ValueError as error:
             raise ValueError("重心外力、施力時間與模擬時間需要有效數值。") from error
-        return validate_heave(parameters)
+        return self.validate(parameters)
+
+
+class HeaveEditor(_CGForceEditor):
+    pass
+
+
+class LateralEditor(_CGForceEditor):
+    limits = LATERAL_LIMITS
+    validate = staticmethod(validate_lateral)
+    description = "平坦地面 · 簧上重心沿 Y 方向受力"
+    directions = "正值向左施力，負值向右。"
+    note = "地面側向反力依各輪正向輪荷分配，適用於抓地條件下的側傾分析。"
+    button_label = "模擬重心側向力"

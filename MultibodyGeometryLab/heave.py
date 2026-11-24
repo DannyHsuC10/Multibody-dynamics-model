@@ -8,7 +8,7 @@ import numpy as np
 from .animation import AnimationFrame
 from .deformable import DynamicsModel, sample_dampers, sample_element_springs
 from .dynamics import (
-    MAX_INTEGRATION_STEP, MAX_STEPS, WheelEquation, WheelLoads, rk4_step, road_profile, sample_times,
+    MAX_INTEGRATION_STEP, MAX_STEPS, WheelEquation, WheelLoads, ramp_force, rk4_step, road_profile, sample_times,
 )
 from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_heave
 from .mount_loads import compute_mount_loads
@@ -32,11 +32,6 @@ class _HeaveEvaluation:
     acceleration: np.ndarray
     force_z: float
     step_limit: float
-
-
-def _force_at(time, force_down, ramp):
-    phase = min(max(time / ramp, 0.), 1.)
-    return -force_down * phase**3 * (10. - phase * (15. - 6. * phase))
 
 
 class _HeaveEquation:
@@ -105,7 +100,7 @@ def simulate_heave(model: DynamicsModel, settings: dict, total_mass: float) -> t
     settings = validate_heave(settings)
     force_down = settings["force_down_n"]
     ramp, duration = settings["ramp_seconds"], settings["duration_seconds"]
-    equation = _HeaveEquation(model, total_mass, lambda time: _force_at(time, force_down, ramp), lambda _: {})
+    equation = _HeaveEquation(model, total_mass, lambda time: ramp_force(time, -force_down, ramp), lambda _: {})
     return _integrate(equation, duration, ramp, (ramp,))
 
 

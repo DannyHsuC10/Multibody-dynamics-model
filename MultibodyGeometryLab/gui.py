@@ -15,7 +15,7 @@ from .animation_settings import PRESETS
 from .deformable import (DamperResult, DynamicsModel, build_dynamics_model, sample_dampers,
                          sample_element_springs, with_axle_pushrod_mounts)
 from .deformable_controls import DeformableEditor
-from .dynamics_controls import HeaveEditor, RoadEditor, TARGET_LABELS
+from .dynamics_controls import HeaveEditor, LateralEditor, RoadEditor, TARGET_LABELS
 from .dynamics_settings import INERTIA_LIMITS
 from .element_editor import ElementEditor
 from .elements import DAMPER_POINT, DEFORMABLE_KINDS, PUSH_ROD, default_elements
@@ -27,7 +27,7 @@ from .hardpoint_import import import_hardpoint_csv
 from .heave import simulate_heave
 from .project import (AXLES, COMPONENTS, DRIVERS, default_project, read_project,
                       save_project, validate)
-from .rigid_body import simulate_rigid_road
+from .rigid_body import simulate_rigid_lateral, simulate_rigid_road
 from .signal_plot import MOUNT_LABELS, SignalView
 from .solver import Unreachable, VehicleResult, solve_vehicle
 from .viewport import MechanismView
@@ -100,6 +100,8 @@ def solve_run_job(results, model, data, mode):
             frames = simulate_heave(model, data["dynamics"]["heave"], data["geometry"]["vehicle"]["mass"])
         elif mode == "road":
             frames = simulate_rigid_road(model, data["dynamics"], data["geometry"]["vehicle"]["mass"])
+        elif mode == "lateral":
+            frames = simulate_rigid_lateral(model, data["dynamics"], data["geometry"]["vehicle"]["mass"])
         else:
             settings = data["animation"]
             frames = build_animation(model.geometry, settings["preset"], settings["amplitude"],
@@ -264,6 +266,8 @@ class Workbench(ttk.Frame):
         dynamics_tabs.add(self.road_editor, text="路面擾動")
         self.heave_editor = HeaveEditor(dynamics_tabs, self.mark_dirty, self.start_heave)
         dynamics_tabs.add(self.heave_editor, text="重心 Heave")
+        self.lateral_editor = LateralEditor(dynamics_tabs, self.mark_dirty, lambda: self.start_run("lateral"))
+        dynamics_tabs.add(self.lateral_editor, text="重心側向力")
         self.pushrod_editor = PushrodEditor(notebook, self.mark_dirty, self.sync_deformables)
         notebook.add(self.pushrod_editor, text="推桿")
         self.element_editor = ElementEditor(notebook, self.on_member_edit, lambda: self.apply(False))
@@ -459,7 +463,8 @@ class Workbench(ttk.Frame):
         except ValueError as error:
             raise ValueError("輪胎垂直阻尼需要有效數值。") from error
         dynamics.update(chassis_inertia=inertia, simulation=self.road_editor.draft(),
-                        heave=self.heave_editor.draft(), tire_damping_ns_m=tire_damping)
+                        heave=self.heave_editor.draft(), lateral=self.lateral_editor.draft(),
+                        tire_damping_ns_m=tire_damping)
         pushrods = self.pushrod_editor.draft()
         for corner, record in pushrods.items():
             if record["inboard"] == "body":
@@ -544,6 +549,7 @@ class Workbench(ttk.Frame):
             dynamics = self.data["dynamics"]
             self.road_editor.populate(dynamics["simulation"])
             self.heave_editor.populate(dynamics["heave"])
+            self.lateral_editor.populate(dynamics["lateral"])
             self.initial_members = dynamics.get("elements")
             if self.initial_members is None:
                 self.initial_members = default_elements(csv_mechanism=prepared.geometry.csv_mechanism)
@@ -659,6 +665,7 @@ class Workbench(ttk.Frame):
         self.set_run_buttons("disabled")
         messages = {"heave": "正在解算車身與四輪的垂直運動…",
                     "road": "正在解算路面擾動下的車身平移、轉動與輪端運動…",
+                    "lateral": "正在解算重心側向力下的車身姿態與輪端運動…",
                     "animation": "正在逐格解算動畫…"}
         self.status.set(messages[mode])
         job, revision = self.animation_job, self.revision
@@ -669,6 +676,7 @@ class Workbench(ttk.Frame):
         self.animation_editor.start_button.configure(state=state)
         self.road_editor.start_button.configure(state=state)
         self.heave_editor.start_button.configure(state=state)
+        self.lateral_editor.start_button.configure(state=state)
 
     def finish_animation(self, revision, data, prepared, mode):
         try:
@@ -689,6 +697,8 @@ class Workbench(ttk.Frame):
         self.show_prepared(prepared, False)
         if mode == "heave":
             label, loop = "重心受力 · Heave", False
+        elif mode == "lateral":
+            label, loop = "重心側向力", False
         elif mode == "road":
             target = TARGET_LABELS[data["dynamics"]["simulation"]["target"]]
             label, loop = f"路面擾動 · {target}", False

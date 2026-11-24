@@ -8,8 +8,8 @@ import numpy as np
 from .animation import AnimationFrame
 from .deformable import DynamicsModel, sample_dampers, sample_element_springs, suspension_terms
 from .rocker import coupled_terms
-from .dynamics import MAX_INTEGRATION_STEP, MAX_STEPS, rk4_step, road_profile, sample_times
-from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_chassis_inertia
+from .dynamics import MAX_INTEGRATION_STEP, MAX_STEPS, ramp_force, rk4_step, road_profile, sample_times
+from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_chassis_inertia, validate_lateral
 from .heave import HeaveSample
 from .mount_loads import compute_mount_loads
 from .solver import CornerSolver, Unreachable, VehicleResult, WHEEL, WheelTravel
@@ -32,6 +32,7 @@ class RigidBodySample:
     angles_deg: np.ndarray
     angular_velocity: np.ndarray
     angular_acceleration: np.ndarray
+    force_y: float = 0.
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,8 @@ class _Evaluation:
     hub_accelerations: np.ndarray
     tire_forces: np.ndarray
     road_heights: np.ndarray
+    force_y: float
+    tire_forces_y: np.ndarray
     step_limit: float
 
 
@@ -72,7 +75,7 @@ def _rate_bound(response, coefficients):
 
 
 class _RigidChassisEquation:
-    def __init__(self, model, total_mass, inertia, target, amplitude, width):
+    def __init__(self, model, total_mass, inertia, target, amplitude, width, lateral_force=lambda _: 0.):
         self.model = model
         self.solvers = tuple(CornerSolver(item) for item in model.geometry.corners)
         self.names = tuple(solver.geometry.name for solver in self.solvers)
@@ -91,6 +94,7 @@ class _RigidChassisEquation:
         self.pivot.setflags(write=False)
         self.amplitudes = np.array([amplitude if target in (name, "all") else 0. for name in self.names])
         self.width = width
+        self.lateral_force = lateral_force
         self.wheel_columns = 6 + np.arange(len(self.names))
         self.force_rows = np.eye(6 + len(self.names))[6:]
         self.tire_stiffnesses = np.full(len(self.names), model.tire_stiffness)
@@ -130,7 +134,15 @@ class _RigidChassisEquation:
 
         wheel_forces = -self.masses[:, None] * bias
         wheel_forces[:, 2] += tire_forces - self.masses * self.model.gravity
+        force_y = self.lateral_force(time)
+        normal_load = tire_forces.sum()
+        tire_forces_y = -force_y * (tire_forces / normal_load) if normal_load > 0. else np.zeros_like(tire_forces)
+        wheel_forces[:, 1] += tire_forces_y
         rhs = np.einsum("ijk,ij->k", jacobian, wheel_forces)
+        rhs[1] += force_y
+        # The lateral road reaction acts at ground level. Represent it by a
+        # force at the concentrated hub and the equivalent roll moment.
+        rhs[3] += (hub_heights - road_heights) @ tire_forces_y
         rhs[2] -= self.body_mass * self.model.gravity
         rhs[3:6] -= np.cross(omega, ground_inertia @ omega)
         spring_rates, damping_rates = self.apply_suspension(rhs, speeds)
@@ -154,7 +166,7 @@ class _RigidChassisEquation:
         step_limit = min(MAX_INTEGRATION_STEP, .35 / sqrt(stiffness_rate), .7 / max(damping_rate, 1e-12),
                          .002 / max(travel_rate, 1e-12), .025 / max(rotation_rate, 1e-12))
         return _Evaluation(self.paths, rotation, acceleration, hub_accelerations, tire_forces, road_heights,
-                           step_limit)
+                           force_y, tire_forces_y, step_limit)
 
     def acceleration_jacobians(self, offsets, tangents):
         """Map chassis linear/angular acceleration and wheel travel acceleration to each hub."""
@@ -201,10 +213,11 @@ class _RigidChassisEquation:
                    for name, force, height in zip(self.names, evaluation.tire_forces, evaluation.road_heights)}
         rotation = evaluation.rotation
         mount_loads = compute_mount_loads(self.model, result, dampers, 0., rotation=rotation,
-                                          wheel_accelerations=dict(zip(self.names, evaluation.hub_accelerations)))
+                                          wheel_accelerations=dict(zip(self.names, evaluation.hub_accelerations)),
+                                          tire_forces_y=dict(zip(self.names, evaluation.tire_forces_y)))
         body = RigidBodySample(
             state[DISPLACEMENT].copy(), state[VELOCITY].copy(), acceleration[:3].copy(),
-            _angles_deg(rotation), state[OMEGA].copy(), acceleration[3:6].copy(),
+            _angles_deg(rotation), state[OMEGA].copy(), acceleration[3:6].copy(), evaluation.force_y,
         )
         for array in (rotation, body.displacement, body.velocity, body.acceleration, body.angles_deg,
                       body.angular_velocity, body.angular_acceleration):
@@ -241,9 +254,25 @@ def simulate_rigid_road(model: DynamicsModel, settings: dict, total_mass: float)
     duration, width = limits["duration_seconds"], limits["bump_seconds"]
     if width > duration:
         raise ValueError("擾動持續時間不可超過模擬時間。")
+    equation = _RigidChassisEquation(model, total_mass, _inertia(settings), target, limits["bump_mm"] / 1000, width)
+    return _integrate(equation, duration, width, (width / 2, width))
+
+
+def simulate_rigid_lateral(model: DynamicsModel, settings: dict, total_mass: float) -> tuple[AnimationFrame, ...]:
+    """Apply a held lateral force at the sprung CG on flat, gripping ground."""
+    lateral = validate_lateral(settings.get("lateral") if isinstance(settings, dict) else None)
+    force, ramp, duration = (lateral[key] for key in ("force_y_n", "ramp_seconds", "duration_seconds"))
+    equation = _RigidChassisEquation(model, total_mass, _inertia(settings), "all", 0., ramp,
+                                     lambda time: ramp_force(time, force, ramp))
+    return _integrate(equation, duration, ramp, (ramp,))
+
+
+def _inertia(settings):
     inertia = validate_chassis_inertia(settings.get("chassis_inertia"))
-    inertia = np.array([inertia[key] for key in ("ixx", "iyy", "izz")])
-    equation = _RigidChassisEquation(model, total_mass, inertia, target, limits["bump_mm"] / 1000, width)
+    return np.array([inertia[key] for key in ("ixx", "iyy", "izz")])
+
+
+def _integrate(equation, duration, input_window, checkpoints):
     state = np.zeros(13 + 2 * len(equation.solvers))
     state[3] = 1.
     frames = []
@@ -251,9 +280,9 @@ def simulate_rigid_road(model: DynamicsModel, settings: dict, total_mass: float)
     steps = 0
     try:
         evaluation = equation.evaluate(state, current)
-        for output in sample_times(duration, width / 2, width):
+        for output in sample_times(duration, *checkpoints):
             while output - current > 1e-12:
-                input_step = width / 32 if current < width else MAX_INTEGRATION_STEP
+                input_step = input_window / 32 if current < input_window else MAX_INTEGRATION_STEP
                 step_limit = min(input_step, evaluation.step_limit)
                 if steps >= MAX_STEPS or step_limit < 1e-8:
                     raise Unreachable("超過積分步數限制，請縮短模擬時間或調整剛性、阻尼與轉動慣量。")

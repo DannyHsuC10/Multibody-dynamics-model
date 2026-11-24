@@ -26,6 +26,11 @@ HEAVE_LIMITS = {
     "ramp_seconds": ("施力上升時間 (s)", .02, 12.),
     "duration_seconds": ("模擬時間 (s)", .5, 12.),
 }
+LATERAL_LIMITS = {
+    "force_y_n": ("重心側向力 Fy (N)", -5000., 5000.),
+    "ramp_seconds": HEAVE_LIMITS["ramp_seconds"],
+    "duration_seconds": HEAVE_LIMITS["duration_seconds"],
+}
 INERTIA_LIMITS = {
     "ixx": ("Ixx · 側傾", .01, 1_000_000.),
     "iyy": ("Iyy · 俯仰", .01, 1_000_000.),
@@ -41,6 +46,10 @@ def default_heave():
     return {"force_down_n": 600., "ramp_seconds": .25, "duration_seconds": 2.5}
 
 
+def default_lateral():
+    return {"force_y_n": 600., "ramp_seconds": .25, "duration_seconds": 2.5}
+
+
 def parallel_pushrod_mount():
     return {"attachment": "UBJ", "mount_reference": "attachment", "mount_mm": [0., 0., 250.]}
 
@@ -54,6 +63,7 @@ def default_dynamics():
         "tire_damping_ns_m": 100.,
         "simulation": {"target": "FL", "bump_mm": 20., "bump_seconds": .25, "duration_seconds": 2.5},
         "heave": default_heave(),
+        "lateral": default_lateral(),
         "chassis_inertia": default_chassis_inertia(),
     }
 
@@ -70,8 +80,16 @@ def bounded(value, label, low, high):
 
 
 def validate_heave(data):
-    require_fields(data, HEAVE_LIMITS, "重心 Heave 設定")
-    settings = {key: bounded(data[key], *limits) for key, limits in HEAVE_LIMITS.items()}
+    return _validate_cg_input(data, HEAVE_LIMITS, "重心 Heave 設定")
+
+
+def validate_lateral(data):
+    return _validate_cg_input(data, LATERAL_LIMITS, "重心側向力設定")
+
+
+def _validate_cg_input(data, limits, label):
+    require_fields(data, limits, label)
+    settings = {key: bounded(data[key], *bounds) for key, bounds in limits.items()}
     if settings["ramp_seconds"] > settings["duration_seconds"]:
         raise ValueError("施力上升時間不可超過模擬時間。")
     return settings
@@ -120,9 +138,10 @@ def _validate_legacy_mount(corner, values):
 
 
 def validate_dynamics(data):
-    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "chassis_inertia")
+    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "lateral", "chassis_inertia")
     if isinstance(data, dict):
-        data = {"heave": default_heave(), "chassis_inertia": default_chassis_inertia(), **data}
+        data = {"heave": default_heave(), "lateral": default_lateral(),
+                "chassis_inertia": default_chassis_inertia(), **data}
     mounts = None
     if isinstance(data, dict) and "pushrod_mounts" in data:
         fields = (*fields, "pushrod_mounts")
@@ -160,6 +179,7 @@ def validate_dynamics(data):
         raise ValueError("擾動持續時間不可超過模擬時間。")
     settings = {"corners": corners, "tire_damping_ns_m": tire_damping,
                 "simulation": {"target": simulation["target"], **inputs}, "heave": validate_heave(data["heave"]),
+                "lateral": validate_lateral(data["lateral"]),
                 "chassis_inertia": validate_chassis_inertia(data["chassis_inertia"])}
     if mounts is not None:
         settings["pushrod_mounts"] = mounts

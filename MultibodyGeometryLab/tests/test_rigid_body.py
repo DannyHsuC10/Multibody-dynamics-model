@@ -7,7 +7,7 @@ import numpy as np
 from MultibodyGeometryLab.deformable import build_dynamics_model
 from MultibodyGeometryLab.geometry import FIXED, POINTS, build_vehicle
 from MultibodyGeometryLab.project import default_project
-from MultibodyGeometryLab.rigid_body import simulate_rigid_road
+from MultibodyGeometryLab.rigid_body import simulate_rigid_lateral, simulate_rigid_road
 
 
 INERTIA = {"ixx": 55., "iyy": 95., "izz": 125.}
@@ -98,6 +98,27 @@ class RigidBodyTests(unittest.TestCase):
                 momentum_rate = world_inertia @ frame.body.angular_acceleration
                 momentum_rate += np.cross(frame.body.angular_velocity, angular_momentum)
                 np.testing.assert_allclose(net_torque, momentum_rate, atol=1e-5, rtol=0)
+
+    def test_lateral_cg_force_ramps_and_transfers_load_between_sides(self):
+        total_mass = self.vehicle["mass"]
+        sprung_mass = total_mass - sum(spec.mass for spec in self.model.corners.values())
+        for force in (600., -600.):
+            with self.subTest(force=force):
+                settings = {**self.settings, "lateral": {
+                    "force_y_n": force, "ramp_seconds": .2, "duration_seconds": .5,
+                }}
+                frames = simulate_rigid_lateral(self.model, settings, total_mass)
+                self.assertEqual(frames[0].body.force_y, 0.)
+                at_ramp_end = next(frame for frame in frames if frame.time == .2)
+                self.assertEqual(at_ramp_end.body.force_y, force)
+                end = frames[-1]
+                self.assertEqual(end.body.force_y, force)
+                self.assertLess(force * end.body.angles_deg[0], 0.)
+                left = end.dampers["FL"].tire_force + end.dampers["RL"].tire_force
+                right = end.dampers["FR"].tire_force + end.dampers["RR"].tire_force
+                self.assertGreater(force * (left - right), 0.)
+                mount_force_y = sum(load.total[1] for load in end.mount_loads.values())
+                self.assertAlmostEqual(force + mount_force_y, sprung_mass * end.body.acceleration[1], places=5)
 
 
 if __name__ == "__main__":

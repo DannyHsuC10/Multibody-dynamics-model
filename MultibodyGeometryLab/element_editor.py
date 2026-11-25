@@ -16,9 +16,9 @@ RIGID_LABEL, DEFORMABLE_LABEL = KIND_LABELS["rigid"], KIND_LABELS["spring_damper
 
 
 class ElementEditor(ttk.Frame):
-    """Edit per-corner member definitions before applying the mechanism."""
+    """Edit per-corner member definitions."""
 
-    def __init__(self, parent, mark_dirty, apply):
+    def __init__(self, parent, mark_dirty):
         super().__init__(parent, padding=8)
         self.mark_dirty = mark_dirty
         self.elements = {name: [] for name in CORNERS}
@@ -72,7 +72,6 @@ class ElementEditor(ttk.Frame):
         buttons.pack(fill="x", pady=(6, 0))
         self.rigid_button = ttk.Button(buttons, text="全車設為剛性", command=self.make_rigid)
         self.rigid_button.pack(side="left")
-        ttk.Button(buttons, text="套用機構", command=apply).pack(side="right")
         ttk.Label(self, textvariable=self.error, wraplength=280, foreground="#9e3829").pack(fill="x", pady=(3, 0))
         self.show_member(None)
 

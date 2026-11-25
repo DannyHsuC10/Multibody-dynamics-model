@@ -37,7 +37,9 @@ INERTIA_LIMITS = {
     "izz": ("Izz · 偏航", .01, 1_000_000.),
 }
 DRIVE_LIMITS = {
-    "torque_nm": ("每顆馬達扭矩指令 (N·m)", 0., 1000.),
+    "torque_nm": ("每顆馬達扭矩上限 (N·m)", 0., 1000.),
+    "target_slip_ratio": ("目標縱向滑移率（0.12 = 12%）", .01, .5),
+    "slip_kp": ("滑移率比例增益 Kp (N·m)", 1., 2000.),
     "steer_deg": ("前輪平均轉角 (°)", -30., 30.),
     "initial_speed_m_s": ("初始車速 (m/s)", 0., 50.),
     "gear_ratio": ("減速比", 1., 20.),
@@ -45,14 +47,18 @@ DRIVE_LIMITS = {
     "wheel_inertia": ("單輪轉動慣量 (kg·m²)", .1, 10.),
     "duration_seconds": ("模擬時間 (s)", .5, 12.),
 }
+DEFAULT_SLIP_CONTROL = {"target_slip_ratio": .12, "slip_kp": 400.}
 
 
 def default_drive():
     return {"torque_nm": 15., "steer_deg": 3., "initial_speed_m_s": 2.,
-            "gear_ratio": 11.2, "gear_efficiency": .95, "wheel_inertia": .45, "duration_seconds": 2.5}
+            "gear_ratio": 11.2, "gear_efficiency": .95, "wheel_inertia": .45, "duration_seconds": 2.5,
+            **DEFAULT_SLIP_CONTROL}
 
 
 def validate_drive(data):
+    if isinstance(data, dict):
+        data = {**DEFAULT_SLIP_CONTROL, **data}
     require_fields(data, DRIVE_LIMITS, "馬達行駛設定")
     return {key: bounded(data[key], *limits) for key, limits in DRIVE_LIMITS.items()}
 

@@ -42,6 +42,12 @@ STEERING_ENDPOINTS = {"RACK": "inner", "TOE": "outer"}
 ROD_ROTATION_LABELS = {"upper_arm": "上 A 臂", "lower_arm": "下 A 臂",
                        "upright": "羊角剛體", "axis_only": "桿軸方向"}
 HINGE_LABELS = {"UCA": "上 A 臂", "LCA": "下 A 臂"}
+RUN_EDITORS = {
+    "road": ("simulation", "路面擾動", RoadEditor),
+    "heave": ("heave", "重心 Heave", HeaveEditor),
+    "lateral": ("lateral", "重心側向力", LateralEditor),
+    "drive": ("drive", "馬達行駛", DriveEditor),
+}
 
 
 def show_number(value):
@@ -126,6 +132,9 @@ class Workbench(ttk.Frame):
         self.edit_index = 0
         self.saved_edit = None
         self.pending_edit = None
+        self.pending_static = None
+        self.run_settings = {}
+        self.run_mode = "road"
         self.hardpoint_draft = None
         self.wheel_center_draft = None
         self.steering_draft = None
@@ -252,21 +261,21 @@ class Workbench(ttk.Frame):
         variable.trace_add("write", self.mark_dirty)
         return variable
 
-    def mark_dirty(self, *_):
+    def mark_dirty(self, *_, refresh_static=True):
         if not self.loading:
             self.revision += 1
             self.dirty = True
             self.update_caption()
             if self.pending_edit is None:
                 self.pending_edit = self.after_idle(self.record_edit)
+            if refresh_static:
+                self.cancel_static_refresh()
+                self.pending_static = self.after(300, self.refresh_static)
 
     def edit_variables(self):
         yield self.name
         yield self.hardpoint_mode
         yield from self.fields.values()
-        yield self.road_editor.target
-        for editor in (self.road_editor, self.heave_editor, self.lateral_editor, self.drive_editor):
-            yield from editor.fields.values()
         for fields in self.pushrod_editor.fields.values():
             for field in fields.values():
                 if isinstance(field, tuple):
@@ -279,7 +288,8 @@ class Workbench(ttk.Frame):
         return (tuple(variable.get() for variable in self.edit_variables()),
                 copy.deepcopy((self.hardpoint_draft, self.wheel_center_draft, self.steering_draft)),
                 copy.deepcopy(self.element_editor.elements),
-                self.deformable_editor.edit_snapshot(), copy.deepcopy(self.hydraulic_design))
+                self.deformable_editor.edit_snapshot(), copy.deepcopy(self.hydraulic_design),
+                copy.deepcopy(self.run_settings))
 
     def record_edit(self):
         self.pending_edit = None
@@ -304,9 +314,11 @@ class Workbench(ttk.Frame):
             return "break"
         self.edit_index = index
         snapshot = self.edit_history[index]
-        values, hardpoints_snapshot, elements, deformable, hydraulic_design = snapshot
+        values, hardpoints_snapshot, elements, deformable, hydraulic_design, run_settings = snapshot
+        self.cancel_static_refresh()
         hydraulic_changed = hydraulic_design != self.hydraulic_design
         self.hydraulic_design = copy.deepcopy(hydraulic_design)
+        self.run_settings = copy.deepcopy(run_settings)
         self.loading = True
         try:
             for variable, value in zip(self.edit_variables(), values):
@@ -400,19 +412,9 @@ class Workbench(ttk.Frame):
         self.hardpoint_table.bind("<Double-1>", self.edit_hardpoint)
         notebook.bind("<<NotebookTabChanged>>", self.refresh_hardpoint_tab)
 
-        dynamics_tabs = ttk.Notebook(notebook)
-        notebook.add(dynamics_tabs, text="輸入")
-        self.road_editor = RoadEditor(dynamics_tabs, self.mark_dirty, self.start_dynamics)
-        dynamics_tabs.add(self.road_editor, text="路面擾動")
-        self.heave_editor = HeaveEditor(dynamics_tabs, self.mark_dirty, self.start_heave)
-        dynamics_tabs.add(self.heave_editor, text="重心 Heave")
-        self.lateral_editor = LateralEditor(dynamics_tabs, self.mark_dirty, lambda: self.start_run("lateral"))
-        dynamics_tabs.add(self.lateral_editor, text="重心側向力")
-        self.drive_editor = DriveEditor(dynamics_tabs, self.mark_dirty, lambda: self.start_run("drive"))
-        dynamics_tabs.add(self.drive_editor, text="馬達行駛")
         self.pushrod_editor = PushrodEditor(notebook, self.mark_dirty, self.sync_deformables)
         notebook.add(self.pushrod_editor, text="推桿")
-        self.element_editor = ElementEditor(notebook, self.on_member_edit, self.apply)
+        self.element_editor = ElementEditor(notebook, self.on_member_edit)
         notebook.add(self.element_editor, text="機構元件")
         self.deformable_editor = DeformableEditor(
             notebook, self.mark_dirty, self.fields["geometry", "vehicle", "tire_stiffness"],
@@ -421,7 +423,8 @@ class Workbench(ttk.Frame):
 
         buttons = ttk.Frame(parent)
         buttons.pack(fill="x", padx=(0, 7), pady=(8, 0))
-        ttk.Button(buttons, text="解算靜態", command=self.apply).pack(side="left", fill="x", expand=True)
+        self.run_button = ttk.Button(buttons, text="輸入求解設定", command=self.open_run_settings)
+        self.run_button.pack(fill="x")
 
     def build_display(self, parent):
         bar = ttk.Frame(parent)
@@ -686,7 +689,7 @@ class Workbench(ttk.Frame):
         self.deformable_editor.sync_members(self.element_editor.elements, self.pushrod_editor.direct_records(),
                                             self.pushrod_editor.explicit_corners())
 
-    def draft(self):
+    def draft(self, *, run_settings=None):
         data = copy.deepcopy(self.edit_base)
         if self.hydraulic_design is None:
             data.pop("hydraulic_design", None)
@@ -705,9 +708,8 @@ class Workbench(ttk.Frame):
             tire_damping = float(self.deformable_editor.tire_damping.get())
         except ValueError as error:
             raise ValueError("輪胎垂直阻尼需要有效數值。") from error
-        dynamics.update(chassis_inertia=inertia, simulation=self.road_editor.draft(),
-                        heave=self.heave_editor.draft(), lateral=self.lateral_editor.draft(),
-                        drive=self.drive_editor.draft(), tire_damping_ns_m=tire_damping)
+        dynamics.update(chassis_inertia=inertia, tire_damping_ns_m=tire_damping)
+        dynamics.update(self.run_settings if run_settings is None else run_settings)
         pushrods = self.pushrod_editor.draft()
         for corner, record in pushrods.items():
             if record["inboard"] == "body":
@@ -775,10 +777,7 @@ class Workbench(ttk.Frame):
             self.wheel_center_draft = copy.deepcopy(self.data.get("wheel_centers"))
             self.steering_draft = copy.deepcopy(self.data["steering"])
             dynamics = self.data["dynamics"]
-            self.road_editor.populate(dynamics["simulation"])
-            self.heave_editor.populate(dynamics["heave"])
-            self.lateral_editor.populate(dynamics["lateral"])
-            self.drive_editor.populate(dynamics["drive"])
+            self.run_settings = {key: dynamics[key] for key, _, _ in RUN_EDITORS.values()}
             self.initial_members = dynamics.get("elements")
             if self.initial_members is None:
                 self.initial_members = default_elements(csv_mechanism=prepared.geometry.csv_mechanism)
@@ -817,6 +816,7 @@ class Workbench(ttk.Frame):
             self.loading = False
 
     def show_prepared(self, prepared):
+        self.cancel_static_refresh()
         self.revision += 1
         self.player.clear()
         if self.signal_view is not None:
@@ -840,16 +840,21 @@ class Workbench(ttk.Frame):
         else:
             self.status.set(f"{mode} · X 向前、Y 向左、Z 向上 · 拖曳旋轉，滾輪縮放")
 
-    def apply(self):
+    def cancel_static_refresh(self):
+        if self.pending_static is not None:
+            self.after_cancel(self.pending_static)
+            self.pending_static = None
+
+    def refresh_static(self):
+        self.pending_static = None
         try:
             data = self.draft()
-            prepared = self.prepare(data)
+            prepared = self.prepare_for_editing(data)
         except (ValueError, ArithmeticError) as error:
-            self.report_error(error)
-            return False
+            self.status.set(f"靜態解算待更新 · {error} · 畫面保留上一個有效結果。")
+            return
         self.data = data
         self.show_prepared(prepared)
-        return prepared.problem is None
 
     def install(self, data, path, *, unsaved=False, load_hydraulics=True):
         data = validate(data)
@@ -876,24 +881,56 @@ class Workbench(ttk.Frame):
                 self.hydraulic_workbench.load_vehicle_project(data)
                 self.refresh_hydraulic_response()
 
-    def start_dynamics(self):
-        self.start_run("road")
-
-    def start_heave(self):
-        self.start_run("heave")
-
-    def start_run(self, mode):
+    def open_run_settings(self):
         if self.animation_job is not None:
             return
+        window = tk.Toplevel(self.root)
+        window.title("輸入求解設定")
+        window.transient(self.root)
+        panel = ttk.Frame(window, padding=12)
+        panel.pack(fill="both", expand=True)
+        tabs = ttk.Notebook(panel)
+        tabs.pack(fill="both", expand=True)
+        editors = {}
+        modes_by_tab = {}
+        for mode, (key, label, editor_type) in RUN_EDITORS.items():
+            editor = editors[mode] = editor_type(tabs)
+            editor.populate(self.run_settings[key])
+            tabs.add(editor, text=label)
+            modes_by_tab[str(editor)] = mode
+        tabs.select(editors[self.run_mode])
+
+        def solve():
+            mode = modes_by_tab[tabs.select()]
+            if self.start_run(mode, editors[mode], window):
+                window.destroy()
+
+        buttons = ttk.Frame(panel)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="求解並計算", command=solve).pack(side="right")
+        ttk.Button(buttons, text="取消", command=window.destroy).pack(side="right", padx=(0, 8))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.grab_set()
+        tabs.focus_set()
+
+    def start_run(self, mode, editor, window):
+        key = RUN_EDITORS[mode][0]
         try:
-            data = self.draft()
+            data = self.draft(run_settings={**self.run_settings, key: editor.draft()})
             prepared = self.prepare(data)
         except (ValueError, ArithmeticError) as error:
-            self.report_error(error)
-            return
+            self.report_error(error, parent=window)
+            return False
+        self.run_mode = mode
+        if data["dynamics"][key] != self.run_settings[key]:
+            self.run_settings[key] = data["dynamics"][key]
+            self.mark_dirty(refresh_static=False)
+        if self.pending_static is not None:
+            self.data = data
+            self.show_prepared(prepared)
         self.player.pause()
         self.animation_job = SimpleQueue()
-        self.set_run_buttons("disabled")
+        self.run_button.configure(state="disabled")
         messages = {"heave": "正在解算車身與四輪的垂直運動…",
                     "road": "正在解算路面擾動下的車身平移、轉動與輪端運動…",
                     "lateral": "正在解算重心側向力下的車身姿態與輪端運動…",
@@ -902,12 +939,7 @@ class Workbench(ttk.Frame):
         job, revision = self.animation_job, self.revision
         Thread(target=solve_run_job, args=(job, prepared.dynamics, data, mode), daemon=True).start()
         self.after(25, self.finish_animation, revision, data, prepared, mode)
-
-    def set_run_buttons(self, state):
-        self.road_editor.start_button.configure(state=state)
-        self.heave_editor.start_button.configure(state=state)
-        self.lateral_editor.start_button.configure(state=state)
-        self.drive_editor.start_button.configure(state=state)
+        return True
 
     def finish_animation(self, revision, data, prepared, mode):
         try:
@@ -916,7 +948,7 @@ class Workbench(ttk.Frame):
             self.after(25, self.finish_animation, revision, data, prepared, mode)
             return
         self.animation_job = None
-        self.set_run_buttons("normal")
+        self.run_button.configure(state="normal")
         if revision != self.revision:
             if self.status.get().startswith("正在"):
                 self.status.set("設定已變更，請重新解算。")
@@ -1065,9 +1097,9 @@ class Workbench(ttk.Frame):
         alpha = show_vector(pose.angular_acceleration)
         self.angular_label.set(f"{name} 羊角角速度 ({omega}) rad/s    角加速度 ({alpha}) rad/s²")
 
-    def report_error(self, error):
+    def report_error(self, error, *, parent=None):
         self.status.set(str(error))
-        messagebox.showerror("無法套用設定", str(error), parent=self.root)
+        messagebox.showerror("無法套用設定", str(error), parent=parent or self.root)
 
     def confirm_discard(self):
         self.flush_edit()

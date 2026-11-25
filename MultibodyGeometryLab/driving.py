@@ -9,6 +9,9 @@ from .dynamics import ramp_force
 from .solver import Unreachable
 
 
+THROTTLE_RAMP_SECONDS = .25
+
+
 @dataclass(frozen=True)
 class DriveSample:
     motor_torque_by_wheel_nm: np.ndarray
@@ -73,7 +76,9 @@ class DriveModel:
         self.torque_limit = np.maximum(torque, 0.)
         self.mirror = np.array([1. if corner.name.endswith("L") else -1. for corner in corners])
         self.radius = np.array([corner.wheel_radius for corner in corners])
-        self.command = settings["torque_nm"]
+        self.command_limit = settings["torque_nm"]
+        self.target_slip_ratio = settings["target_slip_ratio"]
+        self.slip_kp = settings["slip_kp"]
         self.train_rate = settings["gear_ratio"]
         self.gear_eta = settings["gear_efficiency"]
         self.inertia = settings["wheel_inertia"]
@@ -112,11 +117,18 @@ class DriveModel:
         fy = self.api.calculate_fy(condition) * self.mirror * contact_scale
         rpm = np.abs(wheel_speed) * self.train_rate * 60 / (2 * np.pi)
         torque_limit = self.get_motor_torque_data(rpm)
-        torque = np.minimum(ramp_force(time, self.command, .25), torque_limit)
+        throttle_ramp = ramp_force(time, 1., THROTTLE_RAMP_SECONDS)
+        torque_request = self.slip_kp * (self.target_slip_ratio - kappa)
+        torque = np.minimum(throttle_ramp * np.clip(torque_request, 0., self.command_limit), torque_limit)
         wheel_torque = torque * self.train_rate * self.gear_eta
         wheel_acceleration = (wheel_torque - self.radius * fx) / self.inertia
         horizontal = fx[:, None] * forward + fy[:, None] * lateral
         spin_rate = self.slip_stiffness * (normal_load / p["FNOMIN"]) * self.radius**2 / (self.inertia * slip_speed)
+        # The proportional term adds stiffness where the torque command is unsaturated.
+        feedback_active = ((torque_request >= 0.) & (torque_request <= self.command_limit)
+                           & (torque < torque_limit) & (self.command_limit > 0.))
+        spin_rate += (feedback_active * throttle_ramp * self.slip_kp * self.train_rate
+                      * self.gear_eta * self.radius / (self.inertia * slip_speed))
         step_limit = min(.002, 1. / max(float(np.max(spin_rate)), 1.))
         sample = DriveSample(torque, rpm, wheel_torque, wheel_speed.copy(),
                              fx, fy, kappa, np.degrees(alpha))

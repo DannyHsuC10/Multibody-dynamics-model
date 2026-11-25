@@ -5,6 +5,8 @@ import unittest
 import numpy as np
 
 from MultibodyGeometryLab.deformable import build_dynamics_model
+from MultibodyGeometryLab.driving import DriveModel
+from MultibodyGeometryLab.dynamics_settings import validate_drive
 from MultibodyGeometryLab.geometry import FIXED, POINTS, build_vehicle
 from MultibodyGeometryLab.project import default_project
 from MultibodyGeometryLab.rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road
@@ -156,6 +158,24 @@ class RigidBodyTests(unittest.TestCase):
         np.testing.assert_allclose(drive.motor_rpm_by_wheel, np.abs(drive.wheel_speed_rad_s) * 11.2 * 60 / (2 * np.pi))
         np.testing.assert_allclose(drive.wheel_torque_nm, drive.motor_torque_by_wheel_nm * 11.2 * settings["drive"]["gear_efficiency"])
         self.assertTrue(np.all(drive.fx > 0.))
+
+    def test_slip_feedback_ramps_and_limits_each_motor_independently(self):
+        legacy = {key: value for key, value in self.settings["drive"].items()
+                  if key not in ("target_slip_ratio", "slip_kp")}
+        settings = validate_drive(legacy)
+        self.assertEqual(settings["target_slip_ratio"], .12)
+        self.assertEqual(settings["slip_kp"], 400.)
+        drive = DriveModel({**settings, "torque_nm": 8., "slip_kp": 200.}, self.geometry.corners)
+        slip = np.array([.05, .10, .12, .20])
+        wheel_speed = 2. / ((1. - slip) * drive.radius)
+        axes = np.tile([0., 1., 0.], (4, 1))
+        hub_velocity = np.tile([2., 0., 0.], (4, 1))
+        normal_load = np.full(4, 600.)
+        for time, torque in ((0., [0., 0., 0., 0.]), (.125, [4., 2., 0., 0.]), (.25, [8., 4., 0., 0.])):
+            with self.subTest(time=time):
+                _, _, sample, _ = drive.contact(time, wheel_speed, axes, hub_velocity, normal_load)
+                np.testing.assert_allclose(sample.slip_ratio, slip)
+                np.testing.assert_allclose(sample.motor_torque_by_wheel_nm, torque, atol=1e-10)
 
 
 if __name__ == "__main__":

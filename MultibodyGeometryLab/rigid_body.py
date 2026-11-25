@@ -9,7 +9,7 @@ from .animation import AnimationFrame
 from .deformable import DynamicsModel, sample_dampers, sample_element_springs, suspension_terms
 from .rocker import coupled_terms
 from .dynamics import MAX_INTEGRATION_STEP, MAX_STEPS, ramp_force, rk4_step, road_profile, sample_times
-from .driving import DriveModel, DriveSample, steering_rack
+from .driving import THROTTLE_RAMP_SECONDS, DriveModel, DriveSample, steering_rack
 from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_chassis_inertia, validate_drive, validate_lateral
 from .heave import HeaveSample
 from .mount_loads import compute_mount_loads
@@ -355,7 +355,7 @@ def simulate_rigid_drive(model: DynamicsModel, settings: dict, total_mass: float
     drive = validate_drive(settings.get("drive"))
     equation = _RigidChassisEquation(model, total_mass, _inertia(settings), "all", 0., .25,
                                      drive_settings=drive)
-    return _integrate(equation, drive["duration_seconds"], .25, (.25,))
+    return _integrate(equation, drive["duration_seconds"], THROTTLE_RAMP_SECONDS, (THROTTLE_RAMP_SECONDS,))
 
 
 def _integrate(equation, duration, input_window, checkpoints):

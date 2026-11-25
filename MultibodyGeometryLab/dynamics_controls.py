@@ -1,4 +1,4 @@
-"""Edit four direct-acting dampers and a road displacement event."""
+"""Input forms for the supported dynamic simulations."""
 
 import tkinter as tk
 from tkinter import ttk
@@ -19,12 +19,10 @@ def add_entry(parent, row, label, variable):
 
 
 class RoadEditor(ttk.Frame):
-    def __init__(self, parent, mark_dirty, start):
+    def __init__(self, parent):
         super().__init__(parent, padding=10)
         self.target = tk.StringVar(self)
         self.fields = {key: tk.StringVar(self) for key in SIMULATION_LIMITS}
-        for variable in (self.target, *self.fields.values()):
-            variable.trace_add("write", mark_dirty)
 
         inputs = ttk.Frame(self)
         inputs.pack(fill="x")
@@ -34,8 +32,6 @@ class RoadEditor(ttk.Frame):
         target.grid(row=0, column=1, sticky="w")
         for row, (key, (label, _, _)) in enumerate(SIMULATION_LIMITS.items(), 1):
             add_entry(inputs, row, label, self.fields[key])
-        self.start_button = ttk.Button(self, text="模擬路面擾動", command=start)
-        self.start_button.pack(fill="x", pady=(8, 0))
 
     def populate(self, settings):
         self.target.set(TARGET_LABELS[settings["target"]])
@@ -56,9 +52,8 @@ class _CGForceEditor(ttk.Frame):
     description = "平坦地面 · 車身只沿 Z 軸移動"
     directions = "正值向下施力，負值向上。"
     note = "車身質量採車輛總質量扣除四輪輪端質量。"
-    button_label = "模擬重心 Heave"
 
-    def __init__(self, parent, mark_dirty, start):
+    def __init__(self, parent):
         super().__init__(parent, padding=10)
         ttk.Label(self, text=self.description).pack(anchor="w")
         inputs = ttk.Frame(self)
@@ -66,14 +61,11 @@ class _CGForceEditor(ttk.Frame):
         self.fields = {}
         for row, (name, (label, _, _)) in enumerate(self.limits.items()):
             variable = self.fields[name] = tk.StringVar(self)
-            variable.trace_add("write", mark_dirty)
             add_entry(inputs, row, label, variable)
         ttk.Label(self, text=self.directions + "外力在上升時間內平滑增加，之後維持。",
                   wraplength=310).pack(anchor="w", pady=(2, 7))
         ttk.Label(self, text=self.note,
                   wraplength=310).pack(anchor="w", pady=(0, 8))
-        self.start_button = ttk.Button(self, text=self.button_label, command=start)
-        self.start_button.pack(fill="x")
 
     def populate(self, settings):
         for name, variable in self.fields.items():
@@ -97,21 +89,17 @@ class LateralEditor(_CGForceEditor):
     description = "平坦地面 · 簧上重心沿 Y 方向受力"
     directions = "正值向左施力，負值向右。"
     note = "由接地輪胎分擔側向反力，聯立 Fy 與 Mz 維持車頭方向，並計算側傾與輪荷轉移。"
-    button_label = "模擬重心側向力"
 
 
 class DriveEditor(ttk.Frame):
-    def __init__(self, parent, mark_dirty, start):
+    def __init__(self, parent):
         super().__init__(parent, padding=10)
         self.fields = {key: tk.StringVar(self) for key in DRIVE_LIMITS}
         for row, (key, (label, _, _)) in enumerate(DRIVE_LIMITS.items()):
             variable = self.fields[key]
-            variable.trace_add("write", mark_dirty)
             add_entry(self, row, label, variable)
-        ttk.Label(self, text="四輪輪內馬達 · 各馬達依各輪輪速限扭。正轉角向左，齒條在模擬期間固定。",
+        ttk.Label(self, text="各輪依滑移率誤差調節扭矩。起步油門倍率在 0.25 秒內從 0 平滑升至 1。正轉角向左。",
                   wraplength=312).grid(row=len(self.fields), columnspan=2, sticky="w", pady=8)
-        self.start_button = ttk.Button(self, text="模擬馬達行駛", command=start)
-        self.start_button.grid(row=len(self.fields) + 1, columnspan=2, sticky="ew")
 
     def populate(self, settings):
         for key, variable in self.fields.items():

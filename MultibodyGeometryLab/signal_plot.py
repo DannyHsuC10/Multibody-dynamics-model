@@ -17,6 +17,9 @@ AXIS = "#688299"
 TEXT = "#bdcddd"
 CURVE = "#56c6ff"
 CURSOR = "#f6b76f"
+WHEEL_COLORS = (CURVE, "#ffac76", "#65d5bd", "#cc9cef")
+WHEEL_DASHES = ((), (9, 4), (5, 4), (2, 4))
+ALL_WHEELS = "四輪比較"
 NODE = "節點"
 ROD = "桿件"
 HINGE = "A 臂鉸鏈"
@@ -161,12 +164,12 @@ def signal_values(frames, corner, kind, target, signal, rod_options=None):
             values.append(signal.scalar(value))
             continue
         if kind == TIRE:
-            value = None
-            if frame.drive is not None:
-                if signal.field == "normal":
-                    value = frame.dampers[corner].tire_force
-                else:
-                    value = getattr(frame.drive, signal.field)[CORNERS.index(corner)]
+            if signal.field == "normal":
+                damper = (frame.dampers or {}).get(corner)
+                value = getattr(damper, "tire_force", None)
+            else:
+                samples = getattr(frame.drive, signal.field, None)
+                value = None if samples is None else samples[CORNERS.index(corner)]
             values.append(signal.scalar(value))
             continue
         if kind == MOUNT:
@@ -208,7 +211,7 @@ def number(value):
 
 
 class SignalView(ttk.Frame):
-    """Select a solved signal and seek the shared animation timeline."""
+    """Inspect solved signals and seek the shared animation timeline."""
 
     def __init__(self, parent, seek):
         super().__init__(parent, padding=10)
@@ -220,7 +223,7 @@ class SignalView(ttk.Frame):
         self.tire_only = set()
         self.direct_mounts = set(CORNERS)
         self.times = np.array([])
-        self.values = np.array([])
+        self.series = ()
         self.time = None
         self.bounds = None
         self.corner = tk.StringVar(self, value="FL")
@@ -231,7 +234,7 @@ class SignalView(ttk.Frame):
 
         selectors = ttk.Frame(self)
         selectors.pack(fill="x", pady=(0, 8))
-        self.corner_box = self.pick(selectors, 0, "輪位", self.corner, CORNERS, 6, self.corner_changed)
+        self.corner_box = self.pick(selectors, 0, "輪位", self.corner, CORNERS, 9, self.corner_changed)
         self.pick(selectors, 1, "類別", self.kind, tuple(TARGETS), 10, self.set_kind)
         self.target_box = self.pick(selectors, 2, "對象", self.target, POINTS, 18, self.refresh_signal)
         self.signal_box = self.pick(selectors, 3, "訊號", self.signal_label, tuple(SIGNALS[NODE]), 17,
@@ -257,7 +260,10 @@ class SignalView(ttk.Frame):
     def set_kind(self, _event=None):
         kind = self.kind.get()
         signals = tuple(SIGNALS[kind])
-        self.corner_box.configure(state="disabled" if kind == BODY else "readonly")
+        corners = (*CORNERS, ALL_WHEELS) if kind == TIRE else CORNERS
+        self.corner_box.configure(values=corners, state="disabled" if kind == BODY else "readonly")
+        if self.corner.get() not in corners:
+            self.corner.set(CORNERS[0])
         self.signal_box.configure(values=signals)
         self.target.set("WC" if kind == NODE else "")
         self.signal_label.set("位置 Z" if kind == NODE else signals[0])
@@ -324,8 +330,13 @@ class SignalView(ttk.Frame):
         kind = self.kind.get()
         self.signal = SIGNALS[kind][self.signal_label.get()]
         corner = self.corner.get()
-        self.values = signal_values(self.frames, corner, kind, self.target.get(), self.signal,
-                                    self.rod_options[corner])
+        corners = CORNERS if corner == ALL_WHEELS else (corner,)
+        colors = WHEEL_COLORS if corner == ALL_WHEELS else (CURVE,)
+        self.series = tuple(
+            (name, color, dash, signal_values(self.frames, name, kind, self.target.get(), self.signal,
+                                             self.rod_options[name]))
+            for name, color, dash in zip(corners, colors, WHEEL_DASHES)
+        )
         self.draw()
 
     def text(self, x, y, content, *, anchor="center", size=10, color=TEXT, tags=()):
@@ -336,6 +347,8 @@ class SignalView(ttk.Frame):
         kind = self.kind.get()
         if kind == BODY:
             return "地面座標（+Z 向上） · 重心"
+        if self.corner.get() == ALL_WHEELS:
+            return ALL_WHEELS
         if kind == MOUNT:
             return f"地面座標（+Z 向上） · {self.corner.get()} · {self.target.get()}"
         return f"車身座標 · {self.corner.get()} · {self.target.get()}"
@@ -351,7 +364,7 @@ class SignalView(ttk.Frame):
             self.text(width / 2, height / 2, "請先解算一段動畫", size=13)
             self.detail.set(self.scope())
             return
-        finite = self.values[np.isfinite(self.values)]
+        finite = np.concatenate([values[np.isfinite(values)] for _, _, _, values in self.series])
         if not len(finite):
             self.text(width / 2, height / 2, "選定訊號在此工況未定義", size=13)
             self.detail.set(self.scope())
@@ -362,7 +375,9 @@ class SignalView(ttk.Frame):
         precision = max(abs(low), abs(high), 1.) * 1e-8
         padding = max((high - low) * .09, precision) if high > low else max(abs(low) * .05, .1)
         low, high = low - padding, high + padding
-        left, top, right, bottom = 77., 31., width - 27., height - 49.
+        comparing = len(self.series) > 1
+        left, right, bottom = 77., width - 27., height - 49.
+        top = 51. if comparing else 31.
         self.bounds = (left, top, right, bottom, start, end, low, high)
         for value in np.linspace(low, high, 5):
             y = self.plot_y(value)
@@ -379,16 +394,22 @@ class SignalView(ttk.Frame):
             link = self.rod_options[self.corner.get()][self.target.get()]
             if corner.rod_motion[link].rotation_model == "axis_only":
                 label = f"桿軸{label}"
-        self.text(left, 9, f"{label} ({self.signal.unit})", anchor="nw")
+        title = f"{label} ({self.signal.unit})" if self.signal.unit else label
+        self.text(left, 9, title, anchor="nw")
         self.text((left + right) / 2, bottom + 32, "時間 (s)")
 
-        for first, last in finite_runs(self.values):
-            points = [(self.plot_x(self.times[i]), self.plot_y(self.values[i])) for i in range(first, last)]
-            if len(points) > 1:
-                canvas.create_line(*points, fill=CURVE, width=2)
-            else:
-                x, y = points[0]
-                canvas.create_oval(x-2, y-2, x+2, y+2, fill=CURVE, outline="")
+        for index, (name, color, dash, values) in enumerate(self.series):
+            if comparing:
+                x = left + index * 64
+                canvas.create_line(x, 37, x + 22, 37, fill=color, width=2, dash=dash)
+                self.text(x + 27, 37, name, anchor="w", size=9)
+            for first, last in finite_runs(values):
+                points = [(self.plot_x(self.times[i]), self.plot_y(values[i])) for i in range(first, last)]
+                if len(points) > 1:
+                    canvas.create_line(*points, fill=color, width=2, dash=dash)
+                else:
+                    x, y = points[0]
+                    canvas.create_oval(x-2, y-2, x+2, y+2, fill=color, outline="")
         self.draw_cursor()
 
     def plot_x(self, time):
@@ -409,17 +430,22 @@ class SignalView(ttk.Frame):
         index = min(index, len(self.times) - 1)
         if index and self.time - self.times[index-1] <= self.times[index] - self.time:
             index -= 1
-        sample_time, value = self.times[index], self.values[index]
+        sample_time = self.times[index]
         x = self.plot_x(sample_time)
         _, top, _, bottom, *_ = self.bounds
         self.canvas.create_line(x, top, x, bottom, fill=CURSOR, dash=(4, 3), tags="cursor")
-        if np.isfinite(value):
-            y = self.plot_y(value)
-            self.canvas.create_oval(x-4, y-4, x+4, y+4, fill=CURSOR, outline=BACKGROUND, tags="cursor")
-            reading = f"{number(value)} {self.signal.unit}"
-        else:
+        comparing = len(self.series) > 1
+        readings = []
+        for name, color, _, values in self.series:
+            value = values[index]
             reading = "未定義"
-        self.detail.set(f"{scope}   |   t = {sample_time:.3f} s   ·   {reading}")
+            if np.isfinite(value):
+                y = self.plot_y(value)
+                self.canvas.create_oval(x-4, y-4, x+4, y+4, fill=color if comparing else CURSOR,
+                                        outline=BACKGROUND, tags="cursor")
+                reading = f"{number(value)} {self.signal.unit}".rstrip()
+            readings.append(f"{name} {reading}" if comparing else reading)
+        self.detail.set(f"{scope}   |   t = {sample_time:.3f} s   ·   " + "   ·   ".join(readings))
 
     def seek_event(self, event):
         if self.bounds is None:

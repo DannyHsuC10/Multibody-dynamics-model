@@ -232,3 +232,6 @@ __marimo__/
 # Generated optimization plots and CMA-ES logs
 /Inverse_dynamics_optimization/Optimization/figures/*.png
 outcmaes/
+
+# Tire model parameter files
+*.[tT][iI][rR]

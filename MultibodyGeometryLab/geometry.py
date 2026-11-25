@@ -1,6 +1,6 @@
 """Build the reference mechanism from the project's static suspension geometry."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import TYPE_CHECKING
 
@@ -49,6 +49,7 @@ class VehicleGeometry:
     hydraulic_network: object | None = None
     hydraulic_lines: dict | None = None
     hydraulic_cylinders: tuple = ()
+    hydraulic_design: dict | None = None
 
 
 def static_geometry(geometry):
@@ -130,7 +131,10 @@ def build_vehicle(data):
                 pickup = WheelPickup.from_pickup(name, points, key, rod["PUSH_OUT"])
                 endpoints = (RockerEndpoint("body", np.asarray(rod["PUSH_IN"])),
                              RockerEndpoint(name, pickup.pickup, pickup))
-                dampers.append(RockerDamper.from_record({**rod, "name": f"{name}_PUSH_ROD"}, endpoints=endpoints))
+                damper = RockerDamper.from_record({**rod, "name": f"{name}_PUSH_ROD"}, endpoints=endpoints)
+                if rod.get("hydraulic") is not None:
+                    damper = replace(damper, hydraulic_source=("direct", name))
+                dampers.append(damper)
                 cylinders.append(rod.get("hydraulic"))
         elif name in legacy_rockers:
             rocker = Rocker.from_points(name, points, supplemental.get(name, {}))
@@ -148,7 +152,10 @@ def build_vehicle(data):
             xyz = np.asarray(endpoint["xyz"])
             pickup = WheelPickup.from_pickup(mount, reference_points[mount], OUTBOARD_KEYS[part], xyz) if part else None
             endpoints.append(RockerEndpoint(mount, xyz, pickup))
-        dampers.append(RockerDamper.from_record(record, endpoints=tuple(endpoints)))
+        damper = RockerDamper.from_record(record, endpoints=tuple(endpoints))
+        if record.get("hydraulic") is not None:
+            damper = replace(damper, hydraulic_source=("csv", record["name"]))
+        dampers.append(damper)
         cylinders.append(record.get("hydraulic"))
     lines = data.get("hydraulic_lines", {})
     network = HydraulicNetwork.build(lines, cylinders) if any(cylinders) else None
@@ -157,4 +164,5 @@ def build_vehicle(data):
     if len(set(names)) != len(names):
         raise ValueError("變形元件與直連推桿名稱必須唯一。")
     return VehicleGeometry(tuple(model), (-vehicle["cg_to_front"], 0., vehicle["cg_height"]),
-                           chassis_edges(corners), tuple(dampers), "csv_rockers" in data, network, lines, tuple(cylinders))
+                           chassis_edges(corners), tuple(dampers), "csv_rockers" in data, network, lines,
+                           tuple(cylinders), data.get("hydraulic_design"))

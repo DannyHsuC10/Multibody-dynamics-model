@@ -20,8 +20,8 @@ from .element_editor import ElementEditor
 from .elements import DAMPER_POINT, DEFORMABLE_KINDS, PUSH_ROD, default_elements
 from .geometry import LINKS, POINTS, VehicleGeometry, build_vehicle, static_geometry
 from .rocker import rocker_states
-from .pushrod_controls import PushrodEditor
-from .pushrod_settings import pushrod_from_hardpoints
+from .pushrod_controls import PushrodEditor, read_xyz
+from .pushrod_settings import AXIS_POINTS, pushrod_from_hardpoints
 from .hardpoint_import import import_hardpoint_csv
 from .heave import simulate_heave
 from .project import (COMPONENTS, DRIVERS, default_project, read_project,
@@ -35,7 +35,8 @@ from .widgets import ScrollFrame
 
 PROJECTS = Path(__file__).with_name("projects")
 IMPORTS = PROJECTS.parents[1] / "new"
-HARDPOINT_LABELS = {**hardpoints.POINTS, "WC": "輪心", "RACK": "轉向拉桿內側", "TOE": "轉向拉桿外側"}
+HARDPOINT_LABELS = {**hardpoints.POINTS, "WC": "輪心", "RACK": "轉向拉桿內側", "TOE": "轉向拉桿外側",
+                    "ROCKER_A": "搖臂旋轉軸 A 端", "ROCKER_B": "搖臂旋轉軸 B 端"}
 STEERING_ENDPOINTS = {"RACK": "inner", "TOE": "outer"}
 ROD_ROTATION_LABELS = {"upper_arm": "上 A 臂", "lower_arm": "下 A 臂",
                        "upright": "羊角剛體", "axis_only": "桿軸方向"}
@@ -154,6 +155,7 @@ class Workbench(ttk.Frame):
         self.workspace_tabs.add(self.hydraulic_workspace, text="液壓設計")
         self.hydraulic_workbench = None
         self.hydraulic_source = None
+        self.hydraulic_design = None
         self.workspace_tabs.bind("<<NotebookTabChanged>>", self.open_hydraulic_workspace)
 
         self.build_toolbar(self.geometry_workspace)
@@ -188,13 +190,49 @@ class Workbench(ttk.Frame):
                 ttk.Label(self.hydraulic_workspace, padding=16,
                           text="液壓設計需要同一專案中的 Hydraulic_model 資料夾。").pack(anchor="nw")
                 return
-            self.hydraulic_workbench = HydraulicWorkbench(self.hydraulic_workspace, embedded=True)
-            self.hydraulic_workbench.load_vehicle_project(self.hydraulic_source)
+            self.hydraulic_workbench = HydraulicWorkbench(
+                self.hydraulic_workspace, embedded=True,
+                apply_vehicle_design=self.apply_hydraulic_design, reload_vehicle=self.reload_hydraulic_design)
+            self.hydraulic_workbench.load_vehicle_project(self.data)
         try:
             data = self.draft()
         except (ValueError, ArithmeticError):
             data = self.hydraulic_source
         self.hydraulic_workbench.refresh_vehicle_endpoints(data)
+        self.refresh_hydraulic_response()
+
+    def apply_hydraulic_design(self, design):
+        previous = self.hydraulic_design
+        self.hydraulic_design = design
+        try:
+            data = self.draft()
+            prepared = self.prepare(data)
+        except (ValueError, ArithmeticError) as error:
+            self.hydraulic_design = previous
+            self.report_error(error)
+            return False
+        self.data = data
+        self.mark_dirty()
+        self.show_prepared(prepared)
+        return True
+
+    def reload_hydraulic_design(self):
+        try:
+            data = self.draft()
+        except (ValueError, ArithmeticError) as error:
+            self.report_error(error)
+            return
+        hydraulic = self.hydraulic_workbench
+        if hydraulic.has_circuit_edits() and not messagebox.askyesno(
+            "重新匯入車輛油路", "要捨棄液壓設計頁面尚未套用的變更嗎？", parent=self.root
+        ):
+            return
+        data.pop("hydraulic_design", None)
+        hydraulic.load_vehicle_project(data)
+        hydraulic.set_vehicle_coupling(self.hydraulic_design is not None)
+        if self.hydraulic_design is not None:
+            hydraulic.status.set("已重新匯入車輛油路。再次套用後才會更新多體使用的油路。")
+        self.refresh_hydraulic_response()
 
     def cancel_hydraulic_connection(self, event):
         if self.hydraulic_workbench is not None and self.workspace_tabs.select() == str(self.hydraulic_workspace):
@@ -237,7 +275,7 @@ class Workbench(ttk.Frame):
         return (tuple(variable.get() for variable in self.edit_variables()),
                 copy.deepcopy((self.hardpoint_draft, self.wheel_center_draft, self.steering_draft)),
                 copy.deepcopy(self.element_editor.elements),
-                self.deformable_editor.edit_snapshot())
+                self.deformable_editor.edit_snapshot(), copy.deepcopy(self.hydraulic_design))
 
     def record_edit(self):
         self.pending_edit = None
@@ -262,7 +300,9 @@ class Workbench(ttk.Frame):
             return "break"
         self.edit_index = index
         snapshot = self.edit_history[index]
-        values, hardpoints_snapshot, elements, deformable = snapshot
+        values, hardpoints_snapshot, elements, deformable, hydraulic_design = snapshot
+        hydraulic_changed = hydraulic_design != self.hydraulic_design
+        self.hydraulic_design = copy.deepcopy(hydraulic_design)
         self.loading = True
         try:
             for variable, value in zip(self.edit_variables(), values):
@@ -291,6 +331,8 @@ class Workbench(ttk.Frame):
             self.status.set(f"{label}設定 · 目前欄位尚無法解算，預覽為上一個有效結果。")
         else:
             self.data = data
+            if hydraulic_changed and self.hydraulic_workbench is not None:
+                self.hydraulic_workbench.load_vehicle_project(data)
             self.show_prepared(prepared)
             self.status.set(f"{label}設定 · {self.status.get()}")
         return "break"
@@ -349,10 +391,10 @@ class Workbench(ttk.Frame):
         ttk.Checkbutton(points, text="用硬點 XYZ 定義幾何", variable=self.hardpoint_mode,
                         command=self.toggle_hardpoints).pack(anchor="w")
         ttk.Button(points, text="由專案參數重建 A 臂硬點", command=self.generate_hardpoints).pack(anchor="w", pady=4)
-        ttk.Label(points, text="雙擊編輯 · 左右鏡射 · 單位 mm").pack(anchor="w", pady=(0, 4))
-        self.hardpoint_table = make_table(points, ("輪位", "硬點", "X", "Y", "Z"), (50, 70, 63, 63, 63), 16)
+        ttk.Label(points, text="雙擊編輯 · 單位 mm · 搖臂軸 A/B 按輪位獨立設定").pack(anchor="w", pady=(0, 4))
+        self.hardpoint_table = make_table(points, ("輪位", "硬點", "X", "Y", "Z"), (50, 93, 63, 63, 63), 16)
         self.hardpoint_table.bind("<Double-1>", self.edit_hardpoint)
-        notebook.bind("<<NotebookTabChanged>>", self.reveal_selected_hardpoint)
+        notebook.bind("<<NotebookTabChanged>>", self.refresh_hardpoint_tab)
 
         dynamics_tabs = ttk.Notebook(notebook)
         notebook.add(dynamics_tabs, text="輸入")
@@ -475,11 +517,22 @@ class Workbench(ttk.Frame):
 
     def refresh_hardpoints(self):
         source = self.hardpoint_coordinates()
-        rows = [(corner, key, *(show_number(value * 1000) for value in source[corner][key]))
-                for corner in hardpoints.CORNERS for key in HARDPOINT_LABELS]
+        rows = []
+        for corner, points in source.items():
+            for key in HARDPOINT_LABELS:
+                if key not in points:
+                    continue
+                point = points[key]
+                xyz = ("—",) * 3 if point is None else tuple(show_number(value * 1000) for value in point)
+                rows.append((corner, key, *xyz))
         fill_table(self.hardpoint_table, rows)
         self.hardpoint_rows = {row[:2]: item for row, item in zip(rows, self.hardpoint_table.get_children())}
         self.reveal_selected_hardpoint()
+
+    def refresh_hardpoint_tab(self, event):
+        if (event.widget is self.editor_tabs and self.model is not None
+                and self.editor_tabs.select() == str(self.hardpoint_tab)):
+            self.refresh_hardpoints()
 
     def select_hardpoint(self, hardpoint):
         self.selected_hardpoint = hardpoint
@@ -496,6 +549,8 @@ class Workbench(ttk.Frame):
     def hardpoint_coordinates(self):
         direct = self.hardpoint_mode.get()
         source = {corner.name: dict(zip(POINTS, corner.reference)) for corner in self.model.corners}
+        legacy = self.edit_base["geometry"].get(hardpoints.KINEMATICS_KEY, {}).get("corners", {})
+        rocker_corners = self.pushrod_editor.rocker_corners()
         for corner, points in source.items():
             if direct and self.hardpoint_draft is not None:
                 points.update(self.hardpoint_draft[corner])
@@ -505,6 +560,16 @@ class Workbench(ttk.Frame):
             mirror = [1., 1. if corner.endswith("L") else -1., 1.]
             for key, endpoint in STEERING_ENDPOINTS.items():
                 points[key] = np.asarray(points["WC"]) + np.multiply(mirror, self.steering_draft[axle][endpoint])
+            if corner in rocker_corners:
+                for key in AXIS_POINTS:
+                    if self.pushrod_editor.mode(corner) == "project":
+                        points[key] = legacy.get(corner, {}).get(key)
+                    else:
+                        try:
+                            xyz = read_xyz(self.pushrod_editor.fields[corner][key])
+                            points[key] = xyz if np.isfinite(xyz).all() else None
+                        except ValueError:
+                            points[key] = None
         return source
 
     def edit_hardpoint(self, event):
@@ -513,9 +578,13 @@ class Workbench(ttk.Frame):
             return
         corner, key, *_ = self.hardpoint_table.item(row, "values")
         source = self.hardpoint_coordinates()
+        if key not in source[corner]:
+            self.refresh_hardpoints()
+            return
         current = source[corner][key]
         value = simpledialog.askstring("編輯硬點", f"{corner} · {HARDPOINT_LABELS[key]}\n輸入 X, Y, Z（mm）",
-                                       initialvalue=", ".join(f"{v*1000:.12g}" for v in current), parent=self.root)
+                                       initialvalue="" if current is None else ", ".join(f"{v*1000:.12g}" for v in current),
+                                       parent=self.root)
         if value is None:
             return
         try:
@@ -525,7 +594,13 @@ class Workbench(ttk.Frame):
             direct = self.hardpoint_mode.get()
             if key == "WC" and coordinates[1] * (1. if corner.endswith("L") else -1.) <= 0.:
                 raise ValueError("左輪輪心 Y 必須大於 0，右輪輪心 Y 必須小於 0。")
-            if key in STEERING_ENDPOINTS:
+            if key in AXIS_POINTS:
+                other = next(name for name in AXIS_POINTS if name != key)
+                other_coordinates = source[corner][other]
+                if other_coordinates is not None and np.linalg.norm(np.subtract(coordinates, other_coordinates)) <= 1e-8:
+                    raise ValueError(f"{corner} · ROCKER_A 與 ROCKER_B 不可重合。")
+                self.pushrod_editor.set_rocker_point(corner, key, coordinates)
+            elif key in STEERING_ENDPOINTS:
                 axle = "front" if corner.startswith("F") else "rear"
                 center = source[corner]["WC"]
                 mirror = [1., 1. if corner.endswith("L") else -1., 1.]
@@ -579,6 +654,10 @@ class Workbench(ttk.Frame):
 
     def draft(self):
         data = copy.deepcopy(self.edit_base)
+        if self.hydraulic_design is None:
+            data.pop("hydraulic_design", None)
+        else:
+            data["hydraulic_design"] = self.hydraulic_design
         data["geometry"] = self.read_geometry(direct=self.hardpoint_mode.get())
         data["steering"] = copy.deepcopy(self.steering_draft)
         if self.wheel_center_draft is not None:
@@ -747,6 +826,7 @@ class Workbench(ttk.Frame):
             self.after_cancel(self.pending_edit)
             self.pending_edit = None
         self.data = self.edit_base = data
+        self.hydraulic_design = data.get("hydraulic_design")
         self.path, self.dirty = path, unsaved
         self.selected_hardpoint = self.viewport.selected_hardpoint = None
         self.hardpoint_table.selection_remove(*self.hardpoint_table.selection())
@@ -760,6 +840,7 @@ class Workbench(ttk.Frame):
             self.hydraulic_source = data
             if self.hydraulic_workbench is not None:
                 self.hydraulic_workbench.load_vehicle_project(data)
+                self.refresh_hydraulic_response()
 
     def start_dynamics(self):
         self.start_run("road")
@@ -831,6 +912,18 @@ class Workbench(ttk.Frame):
         self.status.set("X 向前、Y 向左、Z 向上 · 拖曳旋轉，滾輪縮放")
         self.refresh_results()
 
+    def refresh_hydraulic_response(self):
+        if (self.hydraulic_workbench is None or self.model is None
+                or self.workspace_tabs.select() != str(self.hydraulic_workspace)):
+            return
+        frame = self.player.frame
+        springs = frame.element_springs if frame is not None else self.neutral_springs
+        readings = {name: reading for corner in (springs or {}).values() for name, reading in corner.items()}
+        response = [(damper.name, readings[damper.name]) for damper in self.model.rocker_dampers
+                    if self.model.hydraulic_design is not None and damper.hydraulic_source is not None
+                    and damper.name in readings]
+        self.hydraulic_workbench.show_vehicle_response(response, frame.time if frame is not None else None)
+
     def refresh_results(self):
         frame = self.player.frame
         if frame is not None:
@@ -847,6 +940,7 @@ class Workbench(ttk.Frame):
             self.result_label.set("靜態全車")
         if self.pose is None:
             return
+        self.refresh_hydraulic_response()
         dampers = frame.dampers if frame is not None else self.neutral_dampers
         springs = frame.element_springs if frame is not None else self.neutral_springs
         rocker_readings = {name: reading for readings in (springs or {}).values()

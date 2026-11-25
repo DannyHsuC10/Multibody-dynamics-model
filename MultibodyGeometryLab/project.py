@@ -52,7 +52,7 @@ def finite_number(value, label):
 def validate(data):
     required = {"format", "schema_version", "geometry", "steering", "motion"}
     if (not isinstance(data, dict) or not required <= data.keys()
-            or data.keys() - required - {"animation", "dynamics", "wheel_centers", "rocker_dampers", "csv_rockers", "pushrods", "hydraulic_lines"}
+            or data.keys() - required - {"animation", "dynamics", "wheel_centers", "rocker_dampers", "csv_rockers", "pushrods", "hydraulic_lines", "hydraulic_design"}
             or data["format"] != FORMAT
             or type(data["schema_version"]) is not int or data["schema_version"] != 1):
         raise ValueError("需要 MultibodyGeometryLab v1 專案或 SuspensionGeometryLab 專案。")
@@ -70,6 +70,10 @@ def validate(data):
             centers[corner] = [finite_number(value, f"{corner}/WC") for value in xyz]
     if "hydraulic_lines" in data:
         data["hydraulic_lines"] = validate_lines(data["hydraulic_lines"])
+    if "hydraulic_design" in data:
+        from Hydraulic_model.vehicle_coupling import read_vehicle_design
+
+        read_vehicle_design(data["hydraulic_design"])
     if "pushrods" in data:
         data["pushrods"] = validate_pushrods(data["pushrods"])
     if "csv_rockers" in data:

@@ -73,6 +73,14 @@ class PushrodEditor(ttk.Frame):
         return tuple(name for name in CORNERS if self.mode(name) == "rocker" or (
             self.mode(name) == "project" and name in self.legacy_rockers))
 
+    def set_rocker_point(self, corner, point, coordinates):
+        variables = self.fields[corner]
+        for variable, value in zip(variables[point], coordinates):
+            variable.set(f"{value * 1000:.15g}")
+        if self.mode(corner) == "project":
+            variables["inboard"].set(INBOARD_LABELS["rocker"])
+            self.change_mode()
+
     def explicit_corners(self):
         return {name for name in CORNERS if self.mode(name) != "project"}
 

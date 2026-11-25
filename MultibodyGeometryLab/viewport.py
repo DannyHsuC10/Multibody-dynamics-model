@@ -181,6 +181,7 @@ class MechanismView(tk.Canvas):
                 rocker = rockers[corner.name]
                 add([rocker.pickup, rocker.pin], color, 2)
                 add([rocker.rocker.pivot, rocker.pin], "#8aa1b5", 2)
+                add([corner.rocker.pivot, corner.rocker.axis_end], "#8aa1b5", 2)
             center = positions[INDEX["WC"]]
             axis = pose.wheel_axis
             forward = np.cross(axis, [0, 0, 1])
@@ -292,9 +293,12 @@ class MechanismView(tk.Canvas):
             self.draw_drive_path(width, height)
 
     def draw_hardpoints(self, project):
-        for corner, pose in self.result.corners.items():
-            for name, (x, y) in zip(POINTS, project(pose.position)):
-                self.hardpoint_pixels[corner, name] = (x, y)
+        for corner in self.model.corners:
+            points = dict(zip(POINTS, self.result.corners[corner.name].position))
+            if corner.rocker is not None:
+                points.update(ROCKER_A=corner.rocker.pivot, ROCKER_B=corner.rocker.axis_end)
+            for name, (x, y) in zip(points, project(list(points.values()))):
+                self.hardpoint_pixels[corner.name, name] = (x, y)
                 self.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#101d2b", outline="#a1bed4")
         if self.selected_hardpoint in self.hardpoint_pixels:
             x, y = self.hardpoint_pixels[self.selected_hardpoint]

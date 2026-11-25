@@ -628,5 +628,77 @@
       -0.62,
       0.19357661005982488
     ]
+  },
+  "hydraulic_design": {
+    "cylinders": {
+      "1": {
+        "name": "ROll_damper_F",
+        "bore_mm": 25.0,
+        "rod_mm": 12.0,
+        "compression_force_n": 0.0,
+        "prescribed_compression_mm": null,
+        "project_source": [
+          "csv",
+          "ROll_damper_F"
+        ]
+      },
+      "2": {
+        "name": "ROll_damper_R",
+        "bore_mm": 25.0,
+        "rod_mm": 12.0,
+        "compression_force_n": 0.0,
+        "prescribed_compression_mm": null,
+        "project_source": [
+          "csv",
+          "ROll_damper_R"
+        ]
+      }
+    },
+    "hoses": [
+      [
+        [
+          1,
+          "cap"
+        ],
+        [
+          2,
+          "cap"
+        ]
+      ],
+      [
+        [
+          1,
+          "rod"
+        ],
+        [
+          2,
+          "rod"
+        ]
+      ]
+    ],
+    "anchors": [
+      [
+        1,
+        "cap",
+        "L"
+      ],
+      [
+        1,
+        "rod",
+        "R"
+      ]
+    ],
+    "lines": {
+      "L": {
+        "pressure_mpa": 0.0,
+        "compliance_cm3_mpa": 5.0
+      },
+      "R": {
+        "pressure_mpa": 0.0,
+        "compliance_cm3_mpa": 5.0
+      }
+    },
+    "springs": {},
+    "links": []
   }
 }

@@ -172,7 +172,8 @@ def pressure_groups(hoses: set[Hose], anchors: Mapping[Port, str] | None = None,
 
 def assemble_design(cylinders: Mapping[int, CylinderDesign], hoses: set[Hose],
                     springs: Mapping[int, DamperDesign], spring_links: Mapping[SpringEnd, SpringTarget],
-                    *, require_connected: bool = True, anchors=None, project_lines=None):
+                    *, require_connected: bool = True, anchors=None, project_lines=None,
+                    default_compliance_cm3_mpa=None):
     if not cylinders:
         raise ValueError("請先新增液壓缸。")
     incomplete = [item.name for key, item in springs.items()
@@ -197,7 +198,7 @@ def assemble_design(cylinders: Mapping[int, CylinderDesign], hoses: set[Hose],
     settings = project_lines or {}
     lines = tuple(
         PressureLine(name, tuple(ports), settings[name].compliance_cm3_mpa, settings[name].pressure_mpa)
-        if name in settings else PressureLine(name, tuple(ports))
+        if name in settings else PressureLine(name, tuple(ports), default_compliance_cm3_mpa)
         for name, ports in ports_by_line.items()
     )
     mechanical_springs = []
@@ -219,9 +220,10 @@ def assemble_design(cylinders: Mapping[int, CylinderDesign], hoses: set[Hose],
 
 def solve_design(cylinders: Mapping[int, CylinderDesign], hoses: set[Hose],
                  springs: Mapping[int, DamperDesign], spring_links: Mapping[SpringEnd, SpringTarget],
-                 *, anchors=None, project_lines=None):
+                 *, anchors=None, project_lines=None, default_compliance_cm3_mpa=None):
     system, model, forces, prescribed = assemble_design(
-        cylinders, hoses, springs, spring_links, anchors=anchors, project_lines=project_lines)
+        cylinders, hoses, springs, spring_links, anchors=anchors, project_lines=project_lines,
+        default_compliance_cm3_mpa=default_compliance_cm3_mpa)
     result = system.solve(forces, prescribed_extension_mm=prescribed)
     compression = {key: -result.rod_extension_mm[cylinder.rod] for key, cylinder in model.items()}
     required_forces = {}

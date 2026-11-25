@@ -240,8 +240,13 @@ def _fit_preloads(geometry, paths, loads, elastic_members, local_ratios):
     jets = {name: (path.position, path.tangent, path.curvature) for name, path in paths.items()}
     rockers, columns, stiffness, hydraulic = [], [], [], []
     network = geometry.hydraulic_network
-    neutral_forces = np.zeros(len(geometry.rocker_dampers)) if network is None else (
-        network.areas.T @ network.initial_pressures)
+    zero = np.zeros(len(geometry.rocker_dampers))
+    if network is None:
+        neutral_forces = zero
+    elif geometry.hydraulic_design is not None:
+        neutral_forces, _, _ = network.axial_response(zero, zero)
+    else:
+        _, neutral_forces, _ = network.response(zero)
     for damper, neutral_force in zip(geometry.rocker_dampers, neutral_forces):
         sample = damper.sample(states, jets)
         rockers.append(replace(damper, static_length=sample.length))
@@ -340,7 +345,8 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
     free_radius = float(vehicle_settings["free_radius"])
     axle_mounts = dynamics_settings.get("pushrod_mounts")
     elements = dynamics_settings.get("elements")
-    if elements is None and (geometry.csv_mechanism or geometry.rocker_dampers or any(
+    if elements is None and (geometry.hydraulic_design is not None or geometry.csv_mechanism
+                             or geometry.rocker_dampers or any(
         corner.rocker is not None or corner.pushrod_configured for corner in geometry.corners
     )):
         elements = default_elements(csv_mechanism=geometry.csv_mechanism)
@@ -373,7 +379,7 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
                 if member.hydraulic is None:
                     continue
                 shared.append(RockerDamper(f"{name} · {member.name}", _member_endpoints(corner, member),
-                                           0., 0., is_hydraulic=True))
+                                           0., 0., is_hydraulic=True, hydraulic_source=(name, member.name)))
                 cylinders.append(member.hydraulic)
         updated.append(corner)
         solver = CornerSolver(corner)
@@ -409,7 +415,13 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
         shared = _resolve_member_endpoints(shared, geometry, updated)
         if len({member.name for member in shared}) != len(shared):
             raise ValueError("液壓缸及變形元件的顯示名稱重複。")
-        network = HydraulicNetwork.build(geometry.hydraulic_lines or {}, cylinders) if any(cylinders) else None
+        if geometry.hydraulic_design is None:
+            network = HydraulicNetwork.build(geometry.hydraulic_lines or {}, cylinders) if any(cylinders) else None
+        else:
+            from Hydraulic_model.vehicle_coupling import assemble_vehicle_circuit
+
+            network = assemble_vehicle_circuit(geometry.hydraulic_design,
+                                               [member.hydraulic_source for member in shared])
         geometry = replace(geometry, corners=tuple(updated), rocker_dampers=tuple(shared), hydraulic_network=network)
         rockers, unbalanced = _fit_preloads(geometry, paths, loads, elastic_members, local_ratios)
         geometry = replace(geometry, rocker_dampers=rockers)
@@ -473,7 +485,7 @@ def sample_element_springs(model, result):
     states = rocker_states(model.geometry, result.corners)
     jets = result_jets(result.corners)
     shared = [damper.sample(states, jets) for damper in model.geometry.rocker_dampers]
-    network_forces, _ = network_response(model.geometry, shared)
+    network_forces, _, _ = network_response(model.geometry, shared)
     for damper, sample, hydraulic in zip(model.geometry.rocker_dampers, shared, network_forces):
         reading = ElasticResult(sample.length, sample.length - damper.static_length,
                                 sample.speed, sample.force + hydraulic, sample.positions, sample.acceleration)

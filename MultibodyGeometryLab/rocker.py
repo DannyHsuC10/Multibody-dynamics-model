@@ -159,6 +159,7 @@ class RockerDamper:
     preload: float = 0.
     hydraulic_force: float = 0.
     is_hydraulic: bool = False
+    hydraulic_source: tuple[str, str] | None = None
 
     @classmethod
     def from_record(cls, record, *, endpoints=None):
@@ -234,13 +235,17 @@ def length_gradient(damper, sample, names):
     return np.array(list(gradient.values()))
 
 
-def network_response(geometry, samples):
+def network_response(geometry, samples, speeds=None):
     network = geometry.hydraulic_network
     if network is None:
-        return np.zeros(len(samples)), None
+        return np.zeros(len(samples)), None, None
     strokes = [sample.length - damper.static_length for damper, sample in zip(geometry.rocker_dampers, samples)]
+    if geometry.hydraulic_design is not None:
+        if speeds is None:
+            speeds = [sample.speed for sample in samples]
+        return network.axial_response(strokes, speeds)
     _, forces, stiffness = network.response(strokes)
-    return forces, stiffness
+    return forces, stiffness, None
 
 
 def coupled_terms(geometry, paths, speeds):
@@ -254,11 +259,14 @@ def coupled_terms(geometry, paths, speeds):
     wheel_rates = np.asarray(speeds)
     terms = np.zeros((len(names), 3))
     samples = [damper.sample(states, jets) for damper in geometry.rocker_dampers]
-    network_forces, network_stiffness = network_response(geometry, samples)
     ratios = np.array([length_gradient(damper, sample, names)
                        for damper, sample in zip(geometry.rocker_dampers, samples)])
-    for damper, sample, ratio, hydraulic in zip(geometry.rocker_dampers, samples, ratios, network_forces):
-        speed = ratio @ wheel_rates
+    axial_speeds = ratios @ wheel_rates
+    network_forces, network_stiffness, network_damping = network_response(geometry, samples, axial_speeds)
+    speed_gradients = []
+    for damper, sample, ratio, speed, hydraulic in zip(
+        geometry.rocker_dampers, samples, ratios, axial_speeds, network_forces
+    ):
         force = damper.axial_force(sample.length, speed) + hydraulic
         terms[:, 0] += force * ratio
         tangent = np.zeros((3, len(names)))
@@ -272,12 +280,18 @@ def coupled_terms(geometry, paths, speeds):
                 second[index] += sign * (sample.axis @ acceleration)
         normal = tangent - np.outer(sample.axis, ratio)
         hessian = normal.T @ normal / sample.length + np.diag(second)
+        speed_gradient = hessian @ wheel_rates
+        speed_gradients.append(speed_gradient)
         elastic = damper.stiffness * np.outer(ratio, ratio) - force * hessian
-        viscous = damper.damping * np.outer(ratio, hessian @ wheel_rates)
+        viscous = damper.damping * np.outer(ratio, speed_gradient)
         terms[:, 1] += np.sum(np.abs(elastic + viscous), axis=1)
         terms[:, 2] += damper.damping * np.abs(ratio) * np.sum(np.abs(ratio))
     if network_stiffness is not None:
         terms[:, 1] += np.sum(np.abs(ratios.T @ network_stiffness @ ratios), axis=1)
+    if network_damping is not None:
+        projected_damping = ratios.T @ network_damping
+        terms[:, 1] += np.sum(np.abs(projected_damping @ speed_gradients), axis=1)
+        terms[:, 2] += np.sum(np.abs(projected_damping @ ratios), axis=1)
     return dict(zip(names, terms))
 
 
@@ -287,7 +301,7 @@ def rocker_node_forces(geometry, result):
     jets = result_jets(result.corners)
     nodes, chassis = {}, {}
     samples = [damper.sample(states, jets) for damper in geometry.rocker_dampers]
-    network_forces, _ = network_response(geometry, samples)
+    network_forces, _, _ = network_response(geometry, samples)
     for damper, sample, hydraulic in zip(geometry.rocker_dampers, samples, network_forces):
         owner = next(endpoint.mount for endpoint in damper.endpoints if endpoint.mount != "body")
         for endpoint, tangent, sign in zip(damper.endpoints, sample.tangents, (-1., 1.)):

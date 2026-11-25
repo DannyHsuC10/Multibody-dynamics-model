@@ -11,6 +11,7 @@ if __package__:
                          project_cylinder_records, project_endpoint_labels, solve_design)
     from .transient_controls import TransientPane
     from .transient_network import simulate_transient
+    from .vehicle_coupling import DEFAULT_COMPLIANCE, read_vehicle_design, vehicle_design
 else:
     from design import (CylinderDesign, DamperDesign, Hose, Port, SpringEnd, SpringTarget,
                         assemble_design, import_project_circuit, pressure_groups,
@@ -53,7 +54,7 @@ def short_name(name, limit=14):
 
 
 class HydraulicWorkbench(ttk.Frame):
-    def __init__(self, parent, *, embedded=False):
+    def __init__(self, parent, *, embedded=False, apply_vehicle_design=None, reload_vehicle=None):
         super().__init__(parent, padding=(12, 8) if embedded else (18, 14))
         if not embedded:
             parent.title("液壓設計平台")
@@ -78,6 +79,9 @@ class HydraulicWorkbench(ttk.Frame):
         self.pressures = {}
         self.compression = {}
         self.required_forces = {}
+        self.apply_vehicle_design = apply_vehicle_design
+        self.reload_vehicle = reload_vehicle
+        self.default_compliance = DEFAULT_COMPLIANCE if apply_vehicle_design is not None else None
         self.status = tk.StringVar(self, "新增液壓缸開始設計，或載入三缸範例。")
         self.editor_title = tk.StringVar(self)
         self.fields = {key: tk.StringVar(self) for key in FIELDS}
@@ -100,6 +104,11 @@ class HydraulicWorkbench(ttk.Frame):
         ):
             ttk.Button(toolbar, text=text, command=command).pack(side="left", padx=(0, 7))
         ttk.Button(toolbar, text="求解靜力", command=self.solve).pack(side="right")
+        if self.apply_vehicle_design is not None:
+            ttk.Button(toolbar, text="套用至多體", command=self.apply_coupling).pack(side="left", padx=(0, 7))
+            self.disconnect_button = ttk.Button(toolbar, text="解除連動", command=self.disconnect_coupling)
+            self.disconnect_button.pack(side="left", padx=(0, 7))
+            ttk.Button(toolbar, text="重新匯入車輛油路", command=self.reload_vehicle).pack(side="left")
 
         content = ttk.Frame(self)
         content.pack(fill="both", expand=True)
@@ -132,6 +141,18 @@ class HydraulicWorkbench(ttk.Frame):
         self.tabs.add(self.results, text="求解結果")
         self.transient = TransientPane(self.tabs, self.run_transient)
         self.tabs.add(self.transient, text="瞬態模擬")
+        if self.apply_vehicle_design is not None:
+            response = ttk.Frame(self.tabs, padding=12)
+            self.vehicle_response_label = ttk.Label(response, text="尚未套用至多體。")
+            self.vehicle_response_label.pack(anchor="w")
+            self.vehicle_response = ttk.Treeview(response, columns=("cylinder", "stroke", "force"), show="headings")
+            for key, label, width in (("cylinder", "車載液壓缸", 142), ("stroke", "伸長 (mm)", 84),
+                                      ("force", "伸張力 (N)", 86)):
+                self.vehicle_response.heading(key, text=label)
+                self.vehicle_response.column(key, width=width, anchor="center")
+            self.vehicle_response.pack(fill="both", expand=True, pady=(6, 0))
+            self.tabs.add(response, text="多體回饋")
+            self.set_vehicle_coupling(False)
         self.project_line_page = ttk.Frame(self.tabs, padding=12)
         ttk.Label(self.project_line_page, text="專案初始油路設定").pack(anchor="w")
         self.line_table = ttk.Treeview(self.project_line_page, columns=("name", "pressure", "compliance", "ports"),
@@ -172,8 +193,7 @@ class HydraulicWorkbench(ttk.Frame):
         self.project_attachment.grid_remove()
         self.apply_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(12, 10))
         self.input_help = ttk.Label(
-            self.editor, text="指定位移留白時使用外力輸入。填入位移後，求解所需外力。正值皆為壓縮。",
-            foreground=MUTED, wraplength=285,
+            self.editor, foreground=MUTED, wraplength=285,
         )
         self.input_help.grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, 12))
         ttk.Label(self.editor, text="●  左側 · 無桿腔", foreground=CAP_COLOR).grid(
@@ -233,6 +253,10 @@ class HydraulicWorkbench(ttk.Frame):
                 self.labels[field].grid_remove()
         self.apply_button.configure(state="normal" if item is not None else "disabled")
         if isinstance(item, CylinderDesign):
+            help_text = "指定位移留白時使用外力輸入。填入位移後，求解所需外力。正值皆為壓縮。"
+            if item.project_source is not None and self.apply_vehicle_design is not None:
+                help_text = "多體連動時，車載缸的位移由多體模型指定。欄位中的外力與位移供液壓頁面獨立求解使用。"
+            self.input_help.configure(text=help_text)
             self.input_help.grid()
         else:
             self.input_help.grid_remove()
@@ -333,7 +357,8 @@ class HydraulicWorkbench(ttk.Frame):
             return None
         system, cylinders, forces, prescribed = assemble_design(
             self.cylinders, self.hoses, self.springs, self.spring_links, require_connected=False,
-            anchors=self.line_anchors, project_lines=self.project_lines)
+            anchors=self.line_anchors, project_lines=self.project_lines,
+            default_compliance_cm3_mpa=self.default_compliance)
         trace = simulate_transient(system, forces, prescribed, settings)
         names = {cylinder.rod: self.cylinders[key].name for key, cylinder in cylinders.items()}
         self.status.set("已完成瞬態模擬。可切換查看活塞桿位移、油壓變化或位移控制所需外力。")
@@ -442,22 +467,63 @@ class HydraulicWorkbench(ttk.Frame):
                 return True
         return False
 
+    def set_vehicle_coupling(self, enabled):
+        if self.apply_vehicle_design is not None:
+            self.disconnect_button.configure(state="normal" if enabled else "disabled")
+
+    def apply_coupling(self):
+        if not self.commit_editor():
+            return
+        design = vehicle_design(self.cylinders, self.hoses, self.line_anchors, self.project_lines,
+                                self.springs, self.spring_links)
+        if self.apply_vehicle_design(design):
+            self.project_circuit_snapshot = self.circuit_snapshot()
+            self.set_vehicle_coupling(True)
+            self.status.set(f"已套用至多體。新油路的預設順應性為 {DEFAULT_COMPLIANCE:g} cm³/MPa。")
+
+    def disconnect_coupling(self):
+        if self.apply_vehicle_design(None):
+            self.set_vehicle_coupling(False)
+            self.status.set("已解除連動。多體將使用專案原有的油路設定。")
+
+    def show_vehicle_response(self, readings, time):
+        if self.apply_vehicle_design is None:
+            return
+        self.vehicle_response.delete(*self.vehicle_response.get_children())
+        if not readings:
+            self.vehicle_response_label.configure(text="尚未套用至多體。")
+            return
+        self.vehicle_response_label.configure(text="靜態參考姿態" if time is None else f"多體時間 {time:.3f} s")
+        for name, reading in readings:
+            self.vehicle_response.insert("", "end", values=(name, f"{reading.deflection * 1000:+.3f}",
+                                                            f"{reading.force:+.3f}"))
+
     def load_vehicle_project(self, data):
         cylinders, self.hoses, self.line_anchors, self.project_lines, legacy_count = import_project_circuit(data)
+        design = data.get("hydraulic_design")
+        if design is not None:
+            cylinders, self.hoses, self.line_anchors, self.project_lines, springs, links = read_vehicle_design(design)
+        else:
+            springs, links = {}, {}
         self.cylinders = cylinders
-        self.positions = {key: (220, 62 + (key - 1) * 114) for key in cylinders}
-        self.springs, self.spring_positions, self.spring_links = {}, {}, {}
-        self.next_id, self.next_spring_id = len(cylinders) + 1, 1
-        self.selection = ("cylinder", 1) if cylinders else None
+        self.positions = {key: (220, 62 + index * 114) for index, key in enumerate(cylinders)}
+        self.springs, self.spring_links = springs, links
+        self.spring_positions = {key: (520, 62 + index * 114) for index, key in enumerate(springs)}
+        self.next_id, self.next_spring_id = max(cylinders, default=0) + 1, max(springs, default=0) + 1
+        self.selection = ("cylinder", next(iter(cylinders))) if cylinders else None
         self.pending_port = self.pending_mechanical = self.drag = None
         self.project_circuit_snapshot = self.circuit_snapshot()
         self.populate_editor()
+        self.refresh_vehicle_endpoints(data)
+        self.set_vehicle_coupling(design is not None)
         self.tabs.select(self.editor)
         self.invalidate_results()
         self.draw_network()
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
-        if cylinders or self.project_lines or legacy_count:
+        if design is not None:
+            message = "已載入儲存的液壓連動設定。修改油路後請再次套用至多體。"
+        elif cylinders or self.project_lines or legacy_count:
             message = f"已從車輛專案載入 {len(cylinders)} 支液壓缸與 {len(self.project_lines)} 條管路。"
             if legacy_count:
                 message += f"另有 {legacy_count} 支固定軸力元件缺少缸徑與油口設定。"
@@ -782,7 +848,8 @@ class HydraulicWorkbench(ttk.Frame):
         try:
             self.pressures, self.compression, self.required_forces = solve_design(
                 self.cylinders, self.hoses, self.springs, self.spring_links,
-                anchors=self.line_anchors, project_lines=self.project_lines)
+                anchors=self.line_anchors, project_lines=self.project_lines,
+                default_compliance_cm3_mpa=self.default_compliance)
         except (ValueError, ArithmeticError) as error:
             self.clear_static_results()
             message = str(error)

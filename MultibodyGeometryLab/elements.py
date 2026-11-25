@@ -12,6 +12,22 @@ DEFORMABLE_KINDS = ("spring_damper", "hydraulic")
 KINDS = ("rigid", *DEFORMABLE_KINDS)
 
 
+def member_endpoint_mount(scope, name, end):
+    return f"member:{scope}:{end}:{name}"
+
+
+def parse_member_endpoint(mount):
+    """Return the element scope, name and end for a linked mount."""
+    if not isinstance(mount, str) or not mount.startswith("member:"):
+        return None
+    _, _, suffix = mount.partition(":")
+    scope, _, rest = suffix.partition(":")
+    end, _, name = rest.partition(":")
+    if scope not in ("csv", "direct", *CORNERS) or end not in ("a", "b") or not name.strip():
+        raise ValueError("變形元件的參照端點不完整。")
+    return scope, name, end
+
+
 @dataclass(frozen=True)
 class Member:
     name: str
@@ -21,6 +37,7 @@ class Member:
     stiffness_n_m: float | None = None
     damping_ns_m: float | None = None
     hydraulic_force_n: float = 0.
+    hydraulic: dict | None = None
 
 
 def default_elements(*, csv_mechanism=False):
@@ -68,6 +85,12 @@ def validate_elements(data):
                     raise ValueError(f"{corner} · {member.name} 的{label}須在 {low:g} 至 {high:g} 之間，或留空沿用輪位值。")
             if member.hydraulic_force_n is None:
                 raise ValueError(f"{corner} · {member.name} 的液壓缸軸力需要數值。")
-            rows.append(asdict(member))
+            row = asdict(member)
+            if member.hydraulic is not None and member.kind == "hydraulic":
+                from .hydraulic_circuits import validate_cylinder
+                row["hydraulic"] = validate_cylinder(member.hydraulic)
+            else:
+                row["hydraulic"] = None
+            rows.append(row)
         result[corner] = rows
     return result

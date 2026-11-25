@@ -6,10 +6,11 @@ from typing import Mapping
 import numpy as np
 
 from .dynamics_settings import MOUNT_REFERENCES, validate_dynamics
-from .elements import DAMPER_POINT, DEFORMABLE_KINDS, PUSH_ROD, Member, default_elements
+from .elements import DAMPER_POINT, DEFORMABLE_KINDS, PUSH_ROD, Member, default_elements, parse_member_endpoint
 from .geometry import MOVING, POINTS, VehicleGeometry
 from .rod_kinematics import RodMotion, axis_motion
-from .rocker import length_gradient, result_jets, rocker_states
+from .hydraulic_circuits import HydraulicNetwork
+from .rocker import RockerDamper, RockerEndpoint, WheelPickup, length_gradient, network_response, result_jets, rocker_states
 from .solver import CornerSolver, Unreachable, VehicleResult, WHEEL
 
 
@@ -212,7 +213,7 @@ def _body_mount(corner, settings, axle_mounts):
 def _elastic_members(corner, path, fixed, settings):
     specs, ratios = [], []
     for member in corner.members:
-        if member.kind not in DEFORMABLE_KINDS:
+        if member.kind not in DEFORMABLE_KINDS or member.hydraulic is not None:
             continue
         k = settings["spring_n_m"] if member.stiffness_n_m is None else member.stiffness_n_m
         c = settings["damper_ns_m"] if member.damping_ns_m is None else member.damping_ns_m
@@ -238,12 +239,15 @@ def _fit_preloads(geometry, paths, loads, elastic_members, local_ratios):
               for path in (paths[corner.name],)}
     jets = {name: (path.position, path.tangent, path.curvature) for name, path in paths.items()}
     rockers, columns, stiffness, hydraulic = [], [], [], []
-    for damper in geometry.rocker_dampers:
+    network = geometry.hydraulic_network
+    neutral_forces = np.zeros(len(geometry.rocker_dampers)) if network is None else (
+        network.areas.T @ network.initial_pressures)
+    for damper, neutral_force in zip(geometry.rocker_dampers, neutral_forces):
         sample = damper.sample(states, jets)
         rockers.append(replace(damper, static_length=sample.length))
         columns.append(length_gradient(damper, sample, names))
         stiffness.append(damper.stiffness)
-        hydraulic.append(damper.hydraulic_force)
+        hydraulic.append(damper.hydraulic_force + neutral_force)
     local_indices = {}
     for name, ratios in local_ratios.items():
         indices = local_indices[name] = []
@@ -273,6 +277,62 @@ def _fit_preloads(geometry, paths, loads, elastic_members, local_ratios):
     return tuple(replace(spec, preload=float(force)) for spec, force in zip(rockers, preload)), unbalanced
 
 
+def _member_endpoints(corner, member):
+    endpoints = []
+    for node in (member.a, member.b):
+        if node == DAMPER_POINT:
+            endpoints.append(RockerEndpoint("body", np.asarray(corner.body_mount)))
+        else:
+            index = POINTS.index(node)
+            xyz = np.asarray(corner.reference[index])
+            pickup = WheelPickup(corner.name, index, xyz, xyz, np.eye(3), None)
+            endpoints.append(RockerEndpoint(corner.name, xyz, pickup))
+    return tuple(endpoints)
+
+
+def _resolve_member_endpoints(shared, original_geometry, corners):
+    if not any(parse_member_endpoint(end.mount) for damper in shared for end in damper.endpoints):
+        return shared
+    direct_names = {f"{corner.name}_PUSH_ROD" for corner in original_geometry.corners
+                    if corner.pushrod_configured and corner.rocker is None}
+    sources = {("direct" if damper.name in direct_names else "csv", damper.name): damper.endpoints
+               for damper in original_geometry.rocker_dampers}
+    sources.update({(corner.name, member.name): _member_endpoints(corner, member)
+                    for corner in corners for member in (corner.members or ())
+                    if member.kind in DEFORMABLE_KINDS})
+    resolved = {}
+
+    def resolve(endpoint, origin):
+        path = set()
+        key = parse_member_endpoint(endpoint.mount)
+        while key is not None and key not in resolved:
+            if key in path:
+                raise ValueError(f"{origin}：變形元件端點形成循環參照。")
+            path.add(key)
+            scope, name, end = key
+            try:
+                endpoint = sources[scope, name][0 if end == "a" else 1]
+            except KeyError as error:
+                raise ValueError(f"{origin}：找不到參照的變形元件「{name}」{end.upper()} 端。") from error
+            key = parse_member_endpoint(endpoint.mount)
+        if key is not None:
+            endpoint = resolved[key]
+        resolved.update(dict.fromkeys(path, endpoint))
+        return endpoint
+
+    result = []
+    for damper in shared:
+        endpoints = tuple(resolve(endpoint, damper.name) for endpoint in damper.endpoints)
+        if any(before is not after for before, after in zip(damper.endpoints, endpoints)):
+            if all(endpoint.mount == "body" for endpoint in endpoints):
+                raise ValueError(f"{damper.name}：兩端皆固定於車體，請至少接到一個可運動的接點。")
+            if np.linalg.norm(endpoints[1].xyz - endpoints[0].xyz) <= 1e-8:
+                raise ValueError(f"{damper.name}：兩端接到重合的位置。")
+            damper = replace(damper, endpoints=endpoints)
+        result.append(damper)
+    return result
+
+
 def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_settings) -> DynamicsModel:
     """Build the rigid graph, axial force elements and vertical tire contacts."""
     gravity = float(vehicle_settings["gravity"])
@@ -289,6 +349,8 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
     elastic_members = None if elements is None else {}
     layouts = None if elements is None else {}
     paths, loads, local_ratios = {}, {}, {}
+    shared = list(geometry.rocker_dampers)
+    cylinders = list(geometry.hydraulic_cylinders or (None,) * len(shared))
     for corner in geometry.corners:
         name = corner.name
         settings = dynamics_settings["corners"][name]
@@ -307,6 +369,12 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
                 fixed = np.asarray(corner.reference[point]) + [0., 0., .25]
                 fixed.setflags(write=False)
                 corner = replace(corner, body_mount=tuple(fixed))
+            for member in members:
+                if member.hydraulic is None:
+                    continue
+                shared.append(RockerDamper(f"{name} · {member.name}", _member_endpoints(corner, member),
+                                           0., 0., is_hydraulic=True))
+                cylinders.append(member.hydraulic)
         updated.append(corner)
         solver = CornerSolver(corner)
         path = solver.wheel_travel(0.)
@@ -338,7 +406,11 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
         corners[name] = DamperSpec(mass, stiffness, damping, fixed, point, length, free_length, static_load, static_axis)
     unbalanced = ()
     if elements is not None:
-        geometry = replace(geometry, corners=tuple(updated))
+        shared = _resolve_member_endpoints(shared, geometry, updated)
+        if len({member.name for member in shared}) != len(shared):
+            raise ValueError("液壓缸及變形元件的顯示名稱重複。")
+        network = HydraulicNetwork.build(geometry.hydraulic_lines or {}, cylinders) if any(cylinders) else None
+        geometry = replace(geometry, corners=tuple(updated), rocker_dampers=tuple(shared), hydraulic_network=network)
         rockers, unbalanced = _fit_preloads(geometry, paths, loads, elastic_members, local_ratios)
         geometry = replace(geometry, rocker_dampers=rockers)
         for name, specs in elastic_members.items():
@@ -400,10 +472,11 @@ def sample_element_springs(model, result):
         samples[name] = corner_samples
     states = rocker_states(model.geometry, result.corners)
     jets = result_jets(result.corners)
-    for damper in model.geometry.rocker_dampers:
-        sample = damper.sample(states, jets)
+    shared = [damper.sample(states, jets) for damper in model.geometry.rocker_dampers]
+    network_forces, _ = network_response(model.geometry, shared)
+    for damper, sample, hydraulic in zip(model.geometry.rocker_dampers, shared, network_forces):
         reading = ElasticResult(sample.length, sample.length - damper.static_length,
-                                sample.speed, sample.force, sample.positions, sample.acceleration)
+                                sample.speed, sample.force + hydraulic, sample.positions, sample.acceleration)
         for endpoint in damper.endpoints:
             if endpoint.mount != "body":
                 samples.setdefault(endpoint.mount, {})[damper.name] = reading

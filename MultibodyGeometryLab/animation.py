@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .heave import HeaveSample
     from .mount_loads import ChassisMountLoads
     from .rigid_body import RigidBodySample
+    from .driving import DriveSample
 
 
 FRAMES_PER_SECOND = 24
@@ -33,6 +34,7 @@ class AnimationFrame:
     mount_loads: "dict[str, ChassisMountLoads] | None" = None
     body: "RigidBodySample | None" = None
     element_springs: "dict[str, dict[str, ElasticResult]] | None" = None
+    drive: "DriveSample | None" = None
 
 
 def _driver_sample(phase, amplitude, duration, bipolar):

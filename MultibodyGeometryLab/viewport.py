@@ -9,13 +9,20 @@ from .rocker import rocker_states
 
 
 INDEX = {name: i for i, name in enumerate(POINTS)}
+PICK_RADIUS = 8
 
 
 class MechanismView(tk.Canvas):
-    def __init__(self, parent):
+    def __init__(self, parent, on_hardpoint=None):
         super().__init__(parent, background="#101d2b", highlightthickness=0, height=360)
         self.model = self.result = self.drag = None
         self.frame = None
+        self.drive_frames = ()
+        self.on_hardpoint = on_hardpoint
+        self.hardpoints_clickable = False
+        self.selected_hardpoint = None
+        self.hardpoint_pixels = {}
+        self.press_origin = None
         self.dampers = {}
         self.rocker_readings = {}
         self.view = "3D"
@@ -23,13 +30,17 @@ class MechanismView(tk.Canvas):
         self.bind("<Configure>", self.draw)
         self.bind("<ButtonPress-1>", self.start_drag)
         self.bind("<B1-Motion>", self.rotate)
+        self.bind("<ButtonRelease-1>", self.finish_drag)
         self.bind("<MouseWheel>", self.wheel)
-        self.bind("<Double-Button-1>", lambda _event: self.reset())
+        self.bind("<Double-Button-1>", self.double_click)
 
-    def set_result(self, model, result, frame=None, dampers=None, rocker_readings=None):
+    def set_result(self, model, result, frame=None, dampers=None, rocker_readings=None, drive_frames=(),
+                   *, hardpoints_clickable=False):
         self.model, self.result, self.frame = model, result, frame
+        self.drive_frames = drive_frames
         self.dampers = dampers or {}
         self.rocker_readings = rocker_readings or {}
+        self.hardpoints_clickable = hardpoints_clickable and self.on_hardpoint is not None
         self.draw()
 
     def change_view(self, view):
@@ -41,9 +52,13 @@ class MechanismView(tk.Canvas):
         self.draw()
 
     def start_drag(self, event):
-        self.drag = event.x, event.y
+        self.press_origin = event.x, event.y
+        self.drag = None
 
     def rotate(self, event):
+        if self.press_origin is not None and self.moved(event):
+            self.drag = self.press_origin
+            self.press_origin = None
         if self.view == "3D" and self.drag is not None:
             x, y = self.drag
             self.azimuth += (event.x - x) * .009
@@ -51,12 +66,46 @@ class MechanismView(tk.Canvas):
             self.drag = event.x, event.y
             self.draw()
 
+    def moved(self, event):
+        x, y = self.press_origin
+        return (event.x - x)**2 + (event.y - y)**2 > 16
+
+    def pick_candidates(self, event):
+        distances = [(float((x - event.x)**2 + (y - event.y)**2), key)
+                     for key, (x, y) in self.hardpoint_pixels.items()]
+        nearest = min((distance for distance, _ in distances), default=float("inf"))
+        if nearest > PICK_RADIUS**2:
+            return []
+        # Exact overlaps occur in orthographic projections. Repeated clicks
+        # at the same spot cycle through those points.
+        return [key for distance, key in sorted(distances) if distance <= min(nearest + 1., PICK_RADIUS**2)]
+
+    def finish_drag(self, event):
+        is_click = self.press_origin is not None and not self.moved(event)
+        self.press_origin = self.drag = None
+        if is_click:
+            candidates = self.pick_candidates(event)
+            if candidates:
+                selected = self.selected_hardpoint
+                index = candidates.index(selected) + 1 if selected in candidates else 0
+                self.on_hardpoint(candidates[index % len(candidates)])
+
+    def double_click(self, event):
+        if not self.pick_candidates(event):
+            self.reset()
+        self.start_drag(event)
+
+    def highlight_hardpoint(self, hardpoint):
+        self.selected_hardpoint = hardpoint
+        self.draw()
+
     def wheel(self, event):
         self.zoom = float(np.clip(self.zoom * (1.12 ** (event.delta / 120)), .55, 5.))
         self.draw()
 
     def draw(self, _event=None):
         self.delete("all")
+        self.hardpoint_pixels.clear()
         if self.result is None:
             return
         if self.view == "前視":
@@ -119,6 +168,8 @@ class MechanismView(tk.Canvas):
                 points = dict(zip(POINTS, positions))
                 points[DAMPER_POINT] = np.asarray(corner.body_mount)
                 for member in corner.members:
+                    if member.hydraulic is not None:
+                        continue
                     a, b = points[member.a], points[member.b]
                     if member.kind == "spring_damper":
                         add(coil_line(a, b), "#f0bb68", 2)
@@ -148,7 +199,7 @@ class MechanismView(tk.Canvas):
             if reading is None:
                 continue
             for endpoint, position in zip(damper.endpoints, reading.endpoints):
-                if endpoint.mount in rockers:
+                if endpoint.pickup is None and endpoint.mount in rockers:
                     add([rockers[endpoint.mount].rocker.pivot, position], "#8aa1b5", 2)
             if damper.is_hydraulic:
                 add(reading.endpoints, "#f0bb68", 4)
@@ -164,7 +215,10 @@ class MechanismView(tk.Canvas):
             frame = self.frame
 
             def to_ground(points):
-                return (np.asarray(points) - frame.pivot) @ frame.rotation.T + frame.pivot + frame.translation
+                translation = frame.translation
+                if frame.drive is not None:
+                    translation = (0., 0., translation[2])
+                return (np.asarray(points) - frame.pivot) @ frame.rotation.T + frame.pivot + translation
 
             # Fit once to the neutral geometry in the current view, so the
             # ground does not pan or zoom as the frame changes.
@@ -203,6 +257,8 @@ class MechanismView(tk.Canvas):
                 self.create_oval(x-3, y-3, x+3, y+3, fill=color, outline="")
                 x += 16
             self.create_text(x, y, text=name, fill=color, font=("Segoe UI", 10, "bold"))
+        if self.hardpoints_clickable:
+            self.draw_hardpoints(project)
         self.create_text(14, 14, anchor="nw", text="前軸  /  後軸  /  轉向拉桿", fill="#b4cadc",
                          font=("Microsoft JhengHei UI", 9))
         if self.dampers:
@@ -215,6 +271,10 @@ class MechanismView(tk.Canvas):
                 roll, pitch, yaw = body.angles_deg
                 readout = (f"簧上重心 ΔZ {body.displacement[2] * 1000:+.1f} mm"
                            f"\nRoll {roll:+.2f}°  Pitch {pitch:+.2f}°  Yaw {yaw:+.2f}°")
+                if self.frame.drive is not None:
+                    drive = self.frame.drive
+                    readout += (f"\n車速 {body.planar_speed * 3.6:.1f} km/h"
+                                f"    馬達 {drive.motor_torque_nm:.1f} N·m / {drive.motor_rpm:.0f} rpm")
             elif heave is not None:
                 readout = (f"重心 ΔZ {heave.displacement * 1000:+.1f} mm    "
                            f"重心外力 Fz {heave.force_z:+.0f} N    (+Z 向上)")
@@ -228,6 +288,34 @@ class MechanismView(tk.Canvas):
                 readout += f"\n四輪接點合力 Fz {mount_z:+.0f} N"
             self.create_text(width-14, 14, anchor="ne", text=readout, justify="right",
                              fill="#d7e6f5", font=("Segoe UI", 9))
+        if self.drive_frames and width > 360 and height > 240:
+            self.draw_drive_path(width, height)
+
+    def draw_hardpoints(self, project):
+        for corner, pose in self.result.corners.items():
+            for name, (x, y) in zip(POINTS, project(pose.position)):
+                self.hardpoint_pixels[corner, name] = (x, y)
+                self.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#101d2b", outline="#a1bed4")
+        if self.selected_hardpoint in self.hardpoint_pixels:
+            x, y = self.hardpoint_pixels[self.selected_hardpoint]
+            self.create_oval(x - 6, y - 6, x + 6, y + 6, outline="#ffd36b", width=2)
+            self.create_text(x + 9, y - 9, anchor="sw", text=" · ".join(self.selected_hardpoint),
+                             fill="#ffd36b", font=("Segoe UI", 9, "bold"))
+
+    def draw_drive_path(self, width, height):
+        origin = np.array([width - 202., height - 120.])
+        dimensions = np.array([188., 106.])
+        self.create_rectangle(*origin, *(origin + dimensions), fill="#101d2b", outline="#43586c")
+        self.create_text(*(origin + [9., 8.]), anchor="nw", text="俯視軌跡 · +X 向右 / +Y 向上",
+                         fill="#d7e6f5", font=("Microsoft JhengHei UI", 8))
+        path = np.array([frame.translation[:2] for frame in self.drive_frames])
+        low, high = path.min(axis=0), path.max(axis=0)
+        scale = min((dimensions - [22., 34.]) / np.maximum(high - low, .1))
+        middle = origin + dimensions / 2 + [0., 9.]
+        points = middle + (path - (high + low) / 2) * [scale, -scale]
+        self.create_line(*points.ravel(), fill="#43586c", width=2)
+        current = middle + (self.frame.translation[:2] - (high + low) / 2) * [scale, -scale]
+        self.create_oval(*(current - 4), *(current + 4), fill="#ffac76", outline="")
 
 
 def coil_line(start, end):

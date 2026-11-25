@@ -4,7 +4,8 @@ import tkinter as tk
 from tkinter import ttk
 
 from ._geometry_support.hardpoints import CORNERS
-from .dynamics_settings import HEAVE_LIMITS, LATERAL_LIMITS, SIMULATION_LIMITS, validate_heave, validate_lateral
+from .dynamics_settings import (DRIVE_LIMITS, HEAVE_LIMITS, LATERAL_LIMITS, SIMULATION_LIMITS,
+                                validate_drive, validate_heave, validate_lateral)
 
 
 TARGET_LABELS = {**dict(zip(CORNERS, CORNERS)), "all": "四輪"}
@@ -97,3 +98,28 @@ class LateralEditor(_CGForceEditor):
     directions = "正值向左施力，負值向右。"
     note = "地面側向反力依各輪正向輪荷分配，適用於抓地條件下的側傾分析。"
     button_label = "模擬重心側向力"
+
+
+class DriveEditor(ttk.Frame):
+    def __init__(self, parent, mark_dirty, start):
+        super().__init__(parent, padding=10)
+        self.fields = {key: tk.StringVar(self) for key in DRIVE_LIMITS}
+        for row, (key, (label, _, _)) in enumerate(DRIVE_LIMITS.items()):
+            variable = self.fields[key]
+            variable.trace_add("write", mark_dirty)
+            add_entry(self, row, label, variable)
+        ttk.Label(self, text="單馬達後驅 · Hoosier W8 Pacejka 輪胎。正轉角向左，齒條在模擬期間固定。",
+                  wraplength=312).grid(row=len(self.fields), columnspan=2, sticky="w", pady=8)
+        self.start_button = ttk.Button(self, text="模擬馬達行駛", command=start)
+        self.start_button.grid(row=len(self.fields) + 1, columnspan=2, sticky="ew")
+
+    def populate(self, settings):
+        for key, variable in self.fields.items():
+            variable.set(str(settings[key]))
+
+    def draft(self):
+        try:
+            settings = {key: float(variable.get()) for key, variable in self.fields.items()}
+        except ValueError as error:
+            raise ValueError("馬達行駛欄位需要有效數值。") from error
+        return validate_drive(settings)

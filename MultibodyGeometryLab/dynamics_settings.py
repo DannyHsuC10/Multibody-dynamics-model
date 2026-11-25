@@ -36,6 +36,25 @@ INERTIA_LIMITS = {
     "iyy": ("Iyy · 俯仰", .01, 1_000_000.),
     "izz": ("Izz · 偏航", .01, 1_000_000.),
 }
+DRIVE_LIMITS = {
+    "torque_nm": ("馬達扭矩指令 (N·m)", 0., 1000.),
+    "steer_deg": ("前輪平均轉角 (°)", -30., 30.),
+    "initial_speed_m_s": ("初始車速 (m/s)", 0., 50.),
+    "gear_ratio": ("減速比", 1., 20.),
+    "gear_efficiency": ("傳動效率", .1, 1.),
+    "wheel_inertia": ("單輪轉動慣量 (kg·m²)", .1, 10.),
+    "duration_seconds": ("模擬時間 (s)", .5, 12.),
+}
+
+
+def default_drive():
+    return {"torque_nm": 15., "steer_deg": 3., "initial_speed_m_s": 2.,
+            "gear_ratio": 4., "gear_efficiency": .95, "wheel_inertia": .45, "duration_seconds": 2.5}
+
+
+def validate_drive(data):
+    require_fields(data, DRIVE_LIMITS, "馬達行駛設定")
+    return {key: bounded(data[key], *limits) for key, limits in DRIVE_LIMITS.items()}
 
 
 def default_chassis_inertia():
@@ -64,6 +83,7 @@ def default_dynamics():
         "simulation": {"target": "FL", "bump_mm": 20., "bump_seconds": .25, "duration_seconds": 2.5},
         "heave": default_heave(),
         "lateral": default_lateral(),
+        "drive": default_drive(),
         "chassis_inertia": default_chassis_inertia(),
     }
 
@@ -138,9 +158,9 @@ def _validate_legacy_mount(corner, values):
 
 
 def validate_dynamics(data):
-    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "lateral", "chassis_inertia")
+    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "lateral", "chassis_inertia", "drive")
     if isinstance(data, dict):
-        data = {"heave": default_heave(), "lateral": default_lateral(),
+        data = {"heave": default_heave(), "lateral": default_lateral(), "drive": default_drive(),
                 "chassis_inertia": default_chassis_inertia(), **data}
     mounts = None
     if isinstance(data, dict) and "pushrod_mounts" in data:
@@ -180,6 +200,7 @@ def validate_dynamics(data):
     settings = {"corners": corners, "tire_damping_ns_m": tire_damping,
                 "simulation": {"target": simulation["target"], **inputs}, "heave": validate_heave(data["heave"]),
                 "lateral": validate_lateral(data["lateral"]),
+                "drive": validate_drive(data["drive"]),
                 "chassis_inertia": validate_chassis_inertia(data["chassis_inertia"])}
     if mounts is not None:
         settings["pushrod_mounts"] = mounts

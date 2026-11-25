@@ -83,6 +83,8 @@ class PushrodEditor(ttk.Frame):
                 saved = self.saved.get(name, {})
                 result[name] = {"name": f"{name}_PUSH_ROD",
                                 **{key: saved.get(key, default) for key, default in COEFFICIENTS.items()}}
+                if "hydraulic" in saved:
+                    result[name]["hydraulic"] = saved["hydraulic"]
         return result
 
     def show_corner(self, _event=None):

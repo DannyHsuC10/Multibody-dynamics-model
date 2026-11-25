@@ -1,4 +1,4 @@
-"""Import hardpoint exports from StaticWireframe and JacobianKinematicsLab."""
+"""Import suspension hardpoints and export the shared static geometry."""
 
 import copy
 import csv
@@ -9,11 +9,15 @@ import numpy as np
 
 from ._geometry_support import hardpoints
 from .dynamics_settings import require_fields
-from .pushrod_settings import COEFFICIENTS, pushrod_from_hardpoints, validate_force
+from .elements import parse_member_endpoint
+from .hydraulic_circuits import CORNERS_PATTERN
+from .pushrod_settings import COEFFICIENTS, OUTBOARD_KEYS, pushrod_from_hardpoints, validate_force
 
+EXCHANGE_FORMAT = "SuspensionHardpoints"
 ALIASES = {"UFI": "UCA_F", "URI": "UCA_R", "LFI": "LCA_F", "LRI": "LCA_R",
-           "WHEEL_CENTER": "WC"}
-CSV_POINTS = set(hardpoints.POINTS) | hardpoints.TIE_ROD_POINTS | {"WC"} | (
+           "WHEEL_CENTER": "WC", "TIE_ROD_IN": "RACK", "TIE_ROD_OUT": "TOE",
+           "PUSH_OUT_LCA": "PUSH_OUT", "PUSHROD_IN": "PUSH_IN", "PUSHROD_OUT": "PUSH_OUT"}
+CSV_POINTS = set(hardpoints.POINTS) | hardpoints.TIE_ROD_POINTS | {"WC", "FORWARD"} | (
     hardpoints.PUSHROD_INBOARD | hardpoints.PUSHROD_OUTBOARD)
 
 
@@ -25,7 +29,10 @@ def validate_rocker_dampers(records):
     for record in result:
         if isinstance(record, dict):
             validate_force(record)
-        require_fields(record, ("name", "a", "b", *COEFFICIENTS), "變形元件")
+        fields = ("name", "a", "b", *COEFFICIENTS)
+        if isinstance(record, dict) and "hydraulic" in record:
+            fields = (*fields, "hydraulic")
+        require_fields(record, fields, "變形元件")
         name = record["name"]
         if not isinstance(name, str) or not name.strip() or name in names:
             raise ValueError("搖臂避震器需要唯一的名稱。")
@@ -35,7 +42,12 @@ def validate_rocker_dampers(records):
             require_fields(endpoint, ("xyz", "mount"), f"{name}/{key}")
             if endpoint["mount"] == "CHASSIS":
                 endpoint["mount"] = "body"
-            if endpoint["mount"] not in (*hardpoints.CORNERS, "body"):
+            linked = parse_member_endpoint(endpoint["mount"])
+            if linked is not None and linked[:2] == ("csv", name):
+                raise ValueError(f"{name}/{key}：不可連接同一元件。")
+            if linked is None and endpoint["mount"] not in (*hardpoints.CORNERS, "body") and not (
+                isinstance(endpoint["mount"], str) and CORNERS_PATTERN.fullmatch(endpoint["mount"])
+            ):
                 raise ValueError(f"{name}/{key}：無法辨識搖臂或車身接點。")
             hardpoints._coordinate(endpoint["xyz"], f"{name}/{key}")
         if {record["a"]["mount"], record["b"]["mount"]} == {"body"}:
@@ -45,10 +57,7 @@ def validate_rocker_dampers(records):
 
 def import_hardpoint_csv(data, path):
     """Overlay the geometry in a CSV onto a multibody project."""
-    from .project import validate
-
     path = Path(path)
-    data = copy.deepcopy(data)
     points = {corner: {} for corner in hardpoints.CORNERS}
     metadata = None
     with path.open(encoding="utf-8-sig", newline="") as handle:
@@ -77,21 +86,96 @@ def import_hardpoint_csv(data, path):
                     raise ValueError("硬點 CSV 需要一筆版本 1 的 jacobian_project 設定。")
                 metadata = entry
 
+    return _apply_hardpoints(data, points, metadata or {}, path.name)
+
+
+def import_hardpoint_json(data, exchange, source):
+    if (not isinstance(exchange, dict) or exchange.get("format") != EXCHANGE_FORMAT
+            or type(exchange.get("version")) is not int or exchange["version"] != 1
+            or not isinstance(exchange.get("points"), dict)):
+        raise ValueError("需要 SuspensionHardpoints v1 硬點 JSON。")
+    points = {corner: {} for corner in hardpoints.CORNERS}
+    for label, xyz in exchange["points"].items():
+        corner, _, name = label.strip().upper().partition("_")
+        name = ALIASES.get(name, name)
+        if corner in points and name in CSV_POINTS:
+            if name in points[corner]:
+                raise ValueError(f"硬點 {corner}_{name} 重複。")
+            points[corner][name] = hardpoints._coordinate(xyz, label).tolist()
+    data = copy.deepcopy(data)
+    tires = exchange.get("tires", {})
+    if isinstance(tires, dict):
+        for axle, corner in (("front", "FL"), ("rear", "RL")):
+            tire = tires.get(corner)
+            if isinstance(tire, dict) and "camber_deg" in tire:
+                data["geometry"][axle]["static_camber_deg"] = tire["camber_deg"]
+        front = tires.get("FL")
+        if isinstance(front, dict):
+            for key, setting in (("radius_mm", "free_radius"), ("width_mm", "tire_width")):
+                if type(front.get(key)) in (int, float):
+                    data["geometry"]["vehicle"][setting] = front[key] / 1000
+    return _apply_hardpoints(data, points, exchange, source)
+
+
+def export_hardpoint_exchange(data):
+    from .geometry import static_geometry
+
+    geometry = data["geometry"]
+    arms, car, centers = static_geometry(geometry)
+    if hardpoints.enabled(geometry):
+        centers = data.get("wheel_centers", centers)
+    supplemental = geometry.get(hardpoints.KINEMATICS_KEY, {}).get("corners", {})
+    points, tires = {}, {}
+    for corner in hardpoints.CORNERS:
+        axle = "front" if corner.startswith("F") else "rear"
+        local = {**supplemental.get(corner, {}), **arms[corner], "WC": centers[corner]}
+        mirror = [1, 1 if corner.endswith("L") else -1, 1]
+        for key, endpoint in (("TOE", "outer"), ("RACK", "inner")):
+            local[key] = np.asarray(centers[corner]) + np.multiply(mirror, data["steering"][axle][endpoint])
+        rod = data.get("pushrods", {}).get(corner)
+        if rod:
+            for key in hardpoints.PUSHROD_INBOARD | hardpoints.PUSHROD_OUTBOARD:
+                local.pop(key, None)
+            local["PUSH_IN"] = rod["PUSH_IN"]
+            local[OUTBOARD_KEYS[rod["outboard"]]] = rod["PUSH_OUT"]
+            if rod["inboard"] == "rocker":
+                local.update({key: rod[key] for key in ("ROCKER_A", "ROCKER_B")})
+        points.update({f"{corner}_{key}": np.asarray(xyz).tolist() for key, xyz in local.items()})
+        tires[corner] = {"width_mm": float(car.tire_width) * 1000, "radius_mm": float(car.free_radius) * 1000,
+                         "toe_deg": None, "camber_deg": geometry[axle].get("static_camber_deg", 0.)}
+    points["CG"] = [-geometry["vehicle"]["cg_to_front"], 0., geometry["vehicle"]["cg_height"]]
+    members = []
+    for record in data.get("rocker_dampers", []):
+        mounts = [record[end]["mount"] for end in ("a", "b")]
+        if all(mount in (*hardpoints.CORNERS, "body") for mount in mounts):
+            member = {"name": record["name"]}
+            for end, mount in zip(("a", "b"), mounts):
+                member[end] = {"xyz": record[end]["xyz"], "mount": "CHASSIS" if mount == "body" else mount}
+            members.append(member)
+    return {"format": EXCHANGE_FORMAT, "version": 1, "points": points, "tires": tires,
+            "deformable_members": members}
+
+
+def _apply_hardpoints(data, points, metadata, source):
+    from .project import validate
+
+    data = copy.deepcopy(data)
     geometry = data["geometry"]
     arms = {}
     for corner, values in points.items():
         missing = set(hardpoints.POINTS) - values.keys()
         if missing:
-            raise ValueError(f"{corner}：硬點 CSV 缺少 {', '.join(sorted(missing))}。")
+            raise ValueError(f"{corner}：硬點缺少 {', '.join(sorted(missing))}。")
         arms[corner] = {name: values[name] for name in hardpoints.POINTS}
     geometry["hardpoints"] = {"enabled": True, "corners": arms}
     centers = {corner: values["WC"] for corner, values in points.items() if "WC" in values}
     data.pop("wheel_centers", None)
     if centers:
-        require_fields(centers, hardpoints.CORNERS, "CSV 輪心")
+        require_fields(centers, hardpoints.CORNERS, "匯入輪心")
         data["wheel_centers"] = centers
 
-    metadata = metadata or {}
+    if "hydraulic_lines" in metadata:
+        data["hydraulic_lines"] = metadata["hydraulic_lines"]
     mount_modes = metadata.get("pushrod_mounts", {})
     if not isinstance(mount_modes, dict):
         raise ValueError("CSV 的 pushrod_mounts 需要輪位與輪端安裝類型。")
@@ -104,15 +188,18 @@ def import_hardpoint_csv(data, path):
         if values.keys() & push_points:
             rod = pushrod_from_hardpoints(values, mount_modes.get(corner))
             if rod is None:
-                raise ValueError(f"{corner} · CSV 推桿需要 PUSH_IN 和 PUSH_OUT。")
+                raise ValueError(f"{corner} · 推桿需要 PUSH_IN 和 PUSH_OUT。")
             if rod["inboard"] == "body":
-                rod.update({key: previous_pushrods.get(corner, {}).get(key, default)
-                            for key, default in COEFFICIENTS.items()})
+                previous = previous_pushrods.get(corner, {})
+                rod.update({key: previous.get(key, default) for key, default in COEFFICIENTS.items()})
+                if "hydraulic" in previous:
+                    rod["hydraulic"] = previous["hydraulic"]
             data["pushrods"][corner] = rod
             for key in push_points:
                 extras.pop(key, None)
-        extras.update({name: value for name, value in values.items() if name in hardpoints.TIE_ROD_POINTS})
-    geometry[hardpoints.KINEMATICS_KEY] = {"unit": "m", "source": path.name, "corners": supplemental}
+        extras.update({name: value for name, value in values.items()
+                       if name in hardpoints.TIE_ROD_POINTS or name == "FORWARD"})
+    geometry[hardpoints.KINEMATICS_KEY] = {"unit": "m", "source": source, "corners": supplemental}
     data["csv_rockers"] = [
         corner for corner, values in points.items()
         if hardpoints.PUSHROD_INBOARD <= values.keys() and len(hardpoints.PUSHROD_OUTBOARD & values.keys()) == 1
@@ -128,12 +215,22 @@ def import_hardpoint_csv(data, path):
     for record in records:
         if record["name"] in automatic:
             corner = record["name"].split("_")[0]
-            data["pushrods"][corner].update({key: record[key] for key in COEFFICIENTS if key in record})
-    data["rocker_dampers"] = [
-        {"name": record["name"], "a": record.get("a"), "b": record.get("b"),
-         **{key: record.get(key, old.get(record["name"], {}).get(key, default)) for key, default in COEFFICIENTS.items()}}
-        for record in records if record["name"] not in automatic
-    ]
+            rod = data["pushrods"][corner]
+            rod.update({key: record[key] for key in COEFFICIENTS if key in record})
+            if rod["kind"] == "hydraulic" and record.get("hydraulic") is not None:
+                rod["hydraulic"] = record["hydraulic"]
+            elif rod["kind"] != "hydraulic" or "hydraulic" in record:
+                rod.pop("hydraulic", None)
+    data["rocker_dampers"] = []
+    for record in records:
+        if record["name"] in automatic:
+            continue
+        previous = old.get(record["name"], {})
+        values = {key: record.get(key, previous.get(key, default)) for key, default in COEFFICIENTS.items()}
+        config = record.get("hydraulic", previous.get("hydraulic"))
+        if values["kind"] == "hydraulic" and config is not None:
+            values["hydraulic"] = config
+        data["rocker_dampers"].append({"name": record["name"], "a": record.get("a"), "b": record.get("b"), **values})
     data = validate(data)
     set_imported_steering(data)
     return validate(data)

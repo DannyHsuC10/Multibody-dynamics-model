@@ -11,8 +11,11 @@ from ._geometry_support import project as geometry_project
 from ._geometry_support.hardpoints import CORNERS
 from .animation_settings import default_animation, validate_animation
 from .dynamics_settings import default_dynamics, validate_dynamics
-from .hardpoint_import import set_imported_steering, validate_rocker_dampers
+from .hardpoint_import import (
+    EXCHANGE_FORMAT, export_hardpoint_exchange, import_hardpoint_json, set_imported_steering, validate_rocker_dampers,
+)
 from .pushrod_settings import validate_pushrods
+from .hydraulic_circuits import validate_lines
 
 AXLES = ("front", "rear")
 DRIVERS = (*CORNERS, *AXLES)
@@ -49,7 +52,7 @@ def finite_number(value, label):
 def validate(data):
     required = {"format", "schema_version", "geometry", "steering", "motion"}
     if (not isinstance(data, dict) or not required <= data.keys()
-            or data.keys() - required - {"animation", "dynamics", "wheel_centers", "rocker_dampers", "csv_rockers", "pushrods"}
+            or data.keys() - required - {"animation", "dynamics", "wheel_centers", "rocker_dampers", "csv_rockers", "pushrods", "hydraulic_lines"}
             or data["format"] != FORMAT
             or type(data["schema_version"]) is not int or data["schema_version"] != 1):
         raise ValueError("需要 MultibodyGeometryLab v1 專案或 SuspensionGeometryLab 專案。")
@@ -65,6 +68,8 @@ def validate(data):
             if not isinstance(xyz, list) or len(xyz) != 3:
                 raise ValueError(f"{corner}/WC 需要三個座標。")
             centers[corner] = [finite_number(value, f"{corner}/WC") for value in xyz]
+    if "hydraulic_lines" in data:
+        data["hydraulic_lines"] = validate_lines(data["hydraulic_lines"])
     if "pushrods" in data:
         data["pushrods"] = validate_pushrods(data["pushrods"])
     if "csv_rockers" in data:
@@ -96,7 +101,26 @@ def validate(data):
 
 def read_project(path):
     """Return the project and whether it can be saved back to the same path."""
-    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
+        if data.get("format") == FORMAT:
+            data.pop("hardpoint_exchange", None)
+            return validate(data), True
+        if data.get("format") == EXCHANGE_FORMAT:
+            return import_hardpoint_json(default_project(), data, path.name), False
+        if "hardpoint_exchange" in data:
+            exchange = data.pop("hardpoint_exchange")
+            base = default_project()
+            if "format" not in data and {"vehicle", "front", "rear", "analysis"} <= data.keys():
+                # The static exchange carries Geometry's active arm and steering coordinates.
+                data.pop("hardpoints", None)
+                data.pop("steering", None)
+                base = from_suspension(data)
+            return import_hardpoint_json(base, exchange, path.name), False
+        if "points" in data and "format" not in data and data.get("mechanism") is None:
+            exchange = {"format": EXCHANGE_FORMAT, "version": 1, **data}
+            return import_hardpoint_json(default_project(), exchange, path.name), False
     if isinstance(data, dict) and "format" not in data:
         project = from_suspension(data)
         set_imported_steering(project)
@@ -110,7 +134,9 @@ def load_project(path):
 
 def save_project(path, data):
     path = Path(path)
-    payload = json.dumps(validate(data), ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    data = validate(data)
+    payload = json.dumps({**data, "hardpoint_exchange": export_hardpoint_exchange(data)},
+                         ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     temp_path = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:

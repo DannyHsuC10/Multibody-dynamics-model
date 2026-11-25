@@ -8,6 +8,7 @@ import numpy as np
 
 from ._geometry_support import hardpoints, project as geometry_project
 from ._geometry_support.static.fv.wireframe_geometry import build_wireframe_scene
+from .elements import parse_member_endpoint
 from .project import validate
 from .pushrod_settings import OUTBOARD_KEYS
 
@@ -45,6 +46,9 @@ class VehicleGeometry:
     chassis_edges: tuple
     rocker_dampers: tuple["RockerDamper", ...] = ()
     csv_mechanism: bool = False
+    hydraulic_network: object | None = None
+    hydraulic_lines: dict | None = None
+    hydraulic_cylinders: tuple = ()
 
 
 def static_geometry(geometry):
@@ -79,14 +83,19 @@ def chassis_edges(corners):
 
 
 def build_vehicle(data):
+    from .hydraulic_circuits import HydraulicNetwork
     from .rocker import Rocker, RockerDamper, RockerEndpoint, WheelPickup
 
     data = validate(data)
     corners, car, centers = static_geometry(data["geometry"])
     if hardpoints.enabled(data["geometry"]):
         centers = data.get("wheel_centers", centers)
-    dampers = [RockerDamper.from_record(record) for record in data.get("rocker_dampers", ())]
-    rocker_mounts = {endpoint.mount for damper in dampers for endpoint in damper.endpoints} - {"body"}
+    records = data.get("rocker_dampers", ())
+    dampers = []
+    cylinders = []
+    rocker_mounts = {record[key]["mount"] for record in records for key in ("a", "b")
+                     if record[key]["mount"] in hardpoints.CORNERS}
+    reference_points = {}
     pushrods = data.get("pushrods", {})
     legacy_rockers = rocker_mounts | set(data.get("csv_rockers", ()))
     for name in rocker_mounts & pushrods.keys():
@@ -101,6 +110,7 @@ def build_vehicle(data):
         mirror = np.array([1., 1. if name.endswith("L") else -1., 1.])
         for key, endpoint in (("TOE", "outer"), ("RACK", "inner")):
             points[key] = points["WC"] + mirror * data["steering"][axle][endpoint]
+        reference_points[name] = points
         reference = np.array([points[point] for point in POINTS])
         lengths = tuple(float(np.linalg.norm(np.asarray(points[a]) - points[b])) for a, b in LINKS)
         if not np.isfinite(reference).all() or not np.isfinite(lengths).all() or min(lengths) < 1e-6:
@@ -121,14 +131,30 @@ def build_vehicle(data):
                 endpoints = (RockerEndpoint("body", np.asarray(rod["PUSH_IN"])),
                              RockerEndpoint(name, pickup.pickup, pickup))
                 dampers.append(RockerDamper.from_record({**rod, "name": f"{name}_PUSH_ROD"}, endpoints=endpoints))
+                cylinders.append(rod.get("hydraulic"))
         elif name in legacy_rockers:
             rocker = Rocker.from_points(name, points, supplemental.get(name, {}))
         model.append(CornerGeometry(name, axle, tuple(map(tuple, reference)), lengths,
                                     float(points["WC"][2]), float(car.tire_width), rocker=rocker,
                                     pushrod_configured=rod is not None))
+    for record in records:
+        endpoints = []
+        for key in ("a", "b"):
+            endpoint = record[key]
+            if parse_member_endpoint(endpoint["mount"]) is not None:
+                endpoints.append(RockerEndpoint(endpoint["mount"], np.asarray(endpoint["xyz"])))
+                continue
+            mount, _, part = endpoint["mount"].partition(":")
+            xyz = np.asarray(endpoint["xyz"])
+            pickup = WheelPickup.from_pickup(mount, reference_points[mount], OUTBOARD_KEYS[part], xyz) if part else None
+            endpoints.append(RockerEndpoint(mount, xyz, pickup))
+        dampers.append(RockerDamper.from_record(record, endpoints=tuple(endpoints)))
+        cylinders.append(record.get("hydraulic"))
+    lines = data.get("hydraulic_lines", {})
+    network = HydraulicNetwork.build(lines, cylinders) if any(cylinders) else None
     vehicle = data["geometry"]["vehicle"]
     names = [damper.name for damper in dampers]
     if len(set(names)) != len(names):
         raise ValueError("變形元件與直連推桿名稱必須唯一。")
     return VehicleGeometry(tuple(model), (-vehicle["cg_to_front"], 0., vehicle["cg_height"]),
-                           chassis_edges(corners), tuple(dampers), "csv_rockers" in data)
+                           chassis_edges(corners), tuple(dampers), "csv_rockers" in data, network, lines, tuple(cylinders))

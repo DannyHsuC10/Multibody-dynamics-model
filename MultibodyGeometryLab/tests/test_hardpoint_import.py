@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 
 from MultibodyGeometryLab.deformable import build_dynamics_model, sample_element_springs
-from MultibodyGeometryLab.elements import DAMPER_POINT, Member, default_elements
+from MultibodyGeometryLab.elements import DAMPER_POINT, PUSH_ROD, Member, default_elements, member_endpoint_mount
 from MultibodyGeometryLab.geometry import POINTS, build_vehicle, static_geometry
 from MultibodyGeometryLab.hardpoint_import import import_hardpoint_csv
 from MultibodyGeometryLab.project import default_project, load_project, save_project
@@ -17,6 +17,33 @@ from MultibodyGeometryLab.solver import solve_vehicle
 
 
 class HardpointImportTests(unittest.TestCase):
+    def test_linked_deformable_endpoints_follow_the_target_nodes(self):
+        data = default_project()
+        fixed = {"mount": "body", "xyz": [0., .3, .65]}
+        target = {"mount": member_endpoint_mount("FL", PUSH_ROD, "b"), "xyz": [0., 0., 0.]}
+        data["rocker_dampers"] = [
+            {"name": "第一支", "a": fixed, "b": target, "spring_n_m": 0., "damper_ns_m": 0.},
+            {"name": "第二支", "a": {"mount": "FR:UCA", "xyz": [0., -.3, .25]},
+             "b": {"mount": member_endpoint_mount("csv", "第一支", "b"), "xyz": [0., 0., 0.]},
+             "spring_n_m": 0., "damper_ns_m": 250.},
+        ]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "linked.json"
+            save_project(path, data)
+            data = load_project(path)
+        model = build_dynamics_model(build_vehicle(data), data["geometry"]["vehicle"], data["dynamics"])
+        self.assertIs(model.geometry.rocker_dampers[0].endpoints[1], model.geometry.rocker_dampers[1].endpoints[1])
+        data["motion"]["FL"].update(position_mm=8., velocity_mm_s=30.)
+        pose = solve_vehicle(model.geometry, data["motion"])
+        readings = sample_element_springs(model, pose)["FL"]
+        np.testing.assert_allclose(readings["第二支"].endpoints[1], pose.corners["FL"].position[POINTS.index("UBJ")])
+        self.assertAlmostEqual(readings["第二支"].force, -250. * readings["第二支"].velocity)
+        self.assertNotEqual(readings["第二支"].velocity, 0.)
+
+        data["rocker_dampers"][0]["b"]["mount"] = member_endpoint_mount("csv", "第二支", "b")
+        with self.assertRaisesRegex(ValueError, "循環"):
+            build_dynamics_model(build_vehicle(data), data["geometry"]["vehicle"], data["dynamics"])
+
     def test_csv_rocker_geometry_and_coefficients_drive_coupled_dynamics(self):
         base = default_project()
         arms, _, centers = static_geometry(base["geometry"])

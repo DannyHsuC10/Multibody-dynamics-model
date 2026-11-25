@@ -54,7 +54,7 @@ class VehicleResult:
 
 @dataclass(frozen=True)
 class WheelTravel:
-    """Position and derivatives with respect to hub travel, at zero rack displacement."""
+    """Position and derivatives with respect to hub travel at a fixed rack position."""
     travel: float
     position: np.ndarray
     tangent: np.ndarray
@@ -70,6 +70,8 @@ class CornerSolver:
         self.lengths = np.array(geometry.lengths)
         self.body_mount = None
         self.locked = False
+        relative = self.reference[N_FIXED + 1:] - self.reference[N_FIXED]
+        self._axis_weights = np.linalg.solve(relative.T, [0., 1., 0.])
         self.rigid_rank = N_MOVING_COORDINATES - 1
         if geometry.members is None:
             self.rigid_links = LINKS
@@ -172,24 +174,27 @@ class CornerSolver:
             raise Unreachable("Jacobian 接近奇異，請減少輸入或檢查硬點。")
         return float(condition)
 
-    def wheel_travel(self, travel, previous=None):
+    def wheel_travel(self, travel, previous=None, *, rack=0.):
         """Trace the same rigid constraints and differentiate along the free wheel coordinate."""
         if not np.isfinite(travel) or abs(travel) > .5:
             raise Unreachable(f"{self.geometry.name}：輪心行程超出 ±500 mm 的求解範圍。")
         if self.locked:
-            if abs(travel) > POSITION_TOLERANCE:
-                raise Unreachable(f"{self.geometry.name} · 固定桿長元件已鎖定輪端，輪心相對車身的行程須為 0。")
+            if max(abs(travel), abs(rack)) > POSITION_TOLERANCE:
+                raise Unreachable(f"{self.geometry.name} · 固定桿長元件已鎖定輪端，無法改變行程或齒條位置。")
             return previous if previous is not None else self._locked_travel()
-        if previous is not None and previous.travel == travel:
+        start_rack = float(previous.position[RACK, 1] - self.reference[RACK, 1]) if previous is not None else 0.
+        if previous is not None and previous.travel == travel and abs(start_rack - rack) <= 1e-14:
             return previous
         start = previous.travel if previous is not None else 0.
         reference = previous.position if previous is not None else self.reference
         q = reference[N_FIXED:].ravel()
-        steps = max(1, ceil(abs(travel - start) / CONTINUATION_STEP))
+        steps = max(1, ceil(max(abs(travel - start), abs(rack - start_rack)) / CONTINUATION_STEP))
         try:
             for step in range(1, steps + 1):
-                q = self._position_step(q, start + (travel - start) * step / steps, 0., VERTICAL)
-            points, _, jacobian, _ = self.equations(q, travel, 0.)
+                fraction = step / steps
+                q = self._position_step(q, start + (travel - start) * fraction,
+                                        start_rack + (rack - start_rack) * fraction, VERTICAL)
+            points, _, jacobian, _ = self.equations(q, travel, rack)
             condition = self._condition(jacobian)
             tangent = np.zeros_like(points)
             rhs = np.zeros(len(jacobian))
@@ -279,13 +284,16 @@ class CornerSolver:
 
         return self._make_result(points, velocity, acceleration, jacobian, condition)
 
+    def wheel_axis_at(self, points):
+        relative = points[N_FIXED + 1:] - points[N_FIXED]
+        axis = relative.T @ self._axis_weights
+        return axis / np.linalg.norm(axis)
+
     def _make_result(self, points, velocity, acceleration, jacobian, condition):
         # Track the wheel axis with its four reference points. For a rigid
         # upright the fitted angular rates recover the exact rigid motion.
         relative = points[N_FIXED + 1:] - points[N_FIXED]
-        reference = self.reference[N_FIXED + 1:] - self.reference[N_FIXED]
-        wheel_axis = relative.T @ np.linalg.solve(reference.T, [0., 1., 0.])
-        wheel_axis /= np.linalg.norm(wheel_axis)
+        wheel_axis = self.wheel_axis_at(points)
         side = 1 if self.geometry.name.endswith("L") else -1
         toe = np.degrees(np.arctan2(-wheel_axis[0], wheel_axis[1]))
         camber = np.degrees(np.arcsin(np.clip(-side * wheel_axis[2], -1., 1.)))

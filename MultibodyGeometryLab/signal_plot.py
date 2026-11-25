@@ -24,6 +24,7 @@ DAMPER = "避震器"
 SPRING = "彈簧阻尼"
 BODY = "車身"
 MOUNT = "車身接點力"
+TIRE = "Pacejka 輪胎"
 ROD_OPTIONS = {f"{a} → {b}": (a, b) for a, b in LINKS}
 HINGE_OPTIONS = {"上 A 臂": "UCA", "下 A 臂": "LCA"}
 MOUNT_LABELS = {"UCA_F": "上 A 臂前接點", "UCA_R": "上 A 臂後接點",
@@ -31,7 +32,7 @@ MOUNT_LABELS = {"UCA_F": "上 A 臂前接點", "UCA_R": "上 A 臂後接點",
                 "RACK": "齒條側接點", "DAMPER": "避震器車身端", "ROCKER": "推桿／搖臂等效反力"}
 MOUNT_OPTIONS = {"本輪接點合力": None, **{label: key for key, label in MOUNT_LABELS.items()}}
 TARGETS = {NODE: POINTS, ROD: tuple(ROD_OPTIONS), HINGE: tuple(HINGE_OPTIONS), DAMPER: ("直推避震器",),
-           BODY: ("重心",), MOUNT: tuple(MOUNT_OPTIONS), SPRING: (PUSH_ROD,)}
+           BODY: ("重心",), MOUNT: tuple(MOUNT_OPTIONS), SPRING: (PUSH_ROD,), TIRE: ("接地",)}
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,18 @@ SIGNALS = {
         "重心外力 Fz": Signal("force_z", "N"),
         "重心外力 Fy": Signal("body.force_y", "N"),
         "四輪接點合力 Fz": Signal("mount_force_z", "N"),
+        "地面車速": Signal("body.planar_speed", "km/h", 3.6),
+        "馬達扭矩": Signal("drive.motor_torque_nm", "N·m"),
+        "馬達轉速": Signal("drive.motor_rpm", "rpm"),
+    },
+    TIRE: {
+        "縱向力 Fx": Signal("fx", "N"),
+        "側向力 Fy": Signal("fy", "N"),
+        "正向力 Fz": Signal("normal", "N"),
+        "縱向滑移率": Signal("slip_ratio", ""),
+        "側偏角": Signal("slip_angle_deg", "°"),
+        "輪速": Signal("wheel_speed_rad_s", "rad/s"),
+        "輪上驅動扭矩": Signal("wheel_torque_nm", "N·m"),
     },
     MOUNT: vector_signals("車身受力", "mount_load", "N"),
 }
@@ -139,8 +152,19 @@ def signal_values(frames, corner, kind, target, signal, rod_options=None):
                          if frame.mount_loads else None)
             elif signal.field.startswith("body."):
                 value = getattr(frame.body, signal.field.removeprefix("body."), None)
+            elif signal.field.startswith("drive."):
+                value = getattr(frame.drive, signal.field.removeprefix("drive."), None)
             else:
                 value = getattr(frame.heave, signal.field, None)
+            values.append(signal.scalar(value))
+            continue
+        if kind == TIRE:
+            value = None
+            if frame.drive is not None:
+                if signal.field == "normal":
+                    value = frame.dampers[corner].tire_force
+                else:
+                    value = getattr(frame.drive, signal.field)[CORNERS.index(corner)]
             values.append(signal.scalar(value))
             continue
         if kind == MOUNT:
@@ -276,7 +300,7 @@ class SignalView(ttk.Frame):
             else:
                 self.rod_options[corner.name] = {member.name: (member.a, member.b) for member in corner.members}
                 self.spring_options[corner.name] = tuple(member.name for member in corner.members
-                                                        if member.kind in DEFORMABLE_KINDS)
+                                                        if member.kind in DEFORMABLE_KINDS and member.hydraulic is None)
             self.spring_options[corner.name] += tuple(
                 damper.name for damper in geometry.rocker_dampers
                 if any(endpoint.mount == corner.name for endpoint in damper.endpoints))

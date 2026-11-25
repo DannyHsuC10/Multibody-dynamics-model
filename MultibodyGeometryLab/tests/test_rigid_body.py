@@ -7,7 +7,7 @@ import numpy as np
 from MultibodyGeometryLab.deformable import build_dynamics_model
 from MultibodyGeometryLab.geometry import FIXED, POINTS, build_vehicle
 from MultibodyGeometryLab.project import default_project
-from MultibodyGeometryLab.rigid_body import simulate_rigid_lateral, simulate_rigid_road
+from MultibodyGeometryLab.rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road
 
 
 INERTIA = {"ixx": 55., "iyy": 95., "izz": 125.}
@@ -119,6 +119,23 @@ class RigidBodyTests(unittest.TestCase):
                 self.assertGreater(force * (left - right), 0.)
                 mount_force_y = sum(load.total[1] for load in end.mount_loads.values())
                 self.assertAlmostEqual(force + mount_force_y, sprung_mass * end.body.acceleration[1], places=5)
+
+    def test_motor_launch_turns_and_respects_the_rear_axle_and_torque_curve(self):
+        settings = {**self.settings, "drive": {
+            **self.settings["drive"], "steer_deg": 3., "initial_speed_m_s": 0.,
+            "torque_nm": 100., "duration_seconds": .5,
+        }}
+        frames = simulate_rigid_drive(self.model, settings, self.vehicle["mass"])
+        start, end = frames[0], frames[-1]
+        self.assertAlmostEqual(np.mean([start.result.corners[name].toe_deg for name in ("FL", "FR")]), 3., places=5)
+        self.assertGreater(end.body.planar_speed, .2)
+        self.assertGreater(end.body.displacement[1], 0.)
+        self.assertGreater(end.body.angles_deg[2], 0.)
+        self.assertGreater(end.drive.motor_torque_nm, 0.)
+        self.assertLess(end.drive.motor_torque_nm, 22.31)
+        np.testing.assert_array_equal(end.drive.wheel_torque_nm[:2], 0.)
+        self.assertAlmostEqual(end.drive.wheel_torque_nm[2], end.drive.wheel_torque_nm[3])
+        self.assertGreater(end.drive.fx[2:].sum(), 0.)
 
 
 if __name__ == "__main__":

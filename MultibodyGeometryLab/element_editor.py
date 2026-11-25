@@ -1,6 +1,7 @@
 """Tk editor for the members connecting the suspension hardpoints."""
 
 from copy import deepcopy
+from math import cos, sin
 import tkinter as tk
 from tkinter import ttk
 
@@ -26,6 +27,8 @@ class ElementEditor(ttk.Frame):
         self.active_corner = "FL"
         self.selected = None
         self.syncing = False
+        self.preview_angles = (.67, .42)
+        self.preview_press = self.preview_drag = None
 
         self.corner = tk.StringVar(self, value=self.active_corner)
         self.kind = tk.StringVar(self)
@@ -40,12 +43,15 @@ class ElementEditor(ttk.Frame):
         wheel = ttk.Combobox(header, textvariable=self.corner, values=CORNERS, state="readonly", width=5)
         wheel.pack(side="left", padx=(5, 9))
         wheel.bind("<<ComboboxSelected>>", self.change_corner)
-        ttk.Label(header, text="點線條或清單選元件").pack(side="left")
+        ttk.Label(header, text="點線條選取 · 拖曳旋轉").pack(side="left")
+        ttk.Button(header, text="重設視角", command=self.reset_preview).pack(side="right")
 
         self.preview = tk.Canvas(self, width=250, height=164, background="#f6f8fa", highlightthickness=0)
         self.preview.pack(fill="both", expand=True, pady=(6, 5))
         self.preview.bind("<Configure>", self.draw)
-        self.preview.bind("<Button-1>", self.choose_line)
+        self.preview.bind("<ButtonPress-1>", self.start_preview_drag)
+        self.preview.bind("<B1-Motion>", self.rotate_preview)
+        self.preview.bind("<ButtonRelease-1>", self.finish_preview_drag)
 
         table = ttk.Frame(self)
         table.pack(fill="x")
@@ -201,10 +207,14 @@ class ElementEditor(ttk.Frame):
         points = self.points.get(self.active_corner)
         if not points:
             return
+        visible = [(index, item) for index, item in enumerate(self.members()) if item["kind"] != "spring_damper"]
+        used_points = {item[end] for _, item in visible for end in ("a", "b")}
+        azimuth, elevation = self.preview_angles
+        ca, sa, ce, se = cos(azimuth), sin(azimuth), cos(elevation), sin(elevation)
         width, height = max(canvas.winfo_width(), 120), max(canvas.winfo_height(), 100)
         projection = {
-            name: (.78 * x + .62 * y, -.26 * x + .32 * y + .91 * z)
-            for name, (x, y, z) in points.items()
+            name: (ca * x + sa * y, -sa * se * x + ca * se * y + ce * z)
+            for name, (x, y, z) in points.items() if name != DAMPER_POINT or name in used_points
         }
         xs, ys = zip(*projection.values())
         x_min, x_max, y_min, y_max = min(xs), max(xs), min(ys), max(ys)
@@ -214,7 +224,7 @@ class ElementEditor(ttk.Frame):
                    height / 2 - scale * (y - (y_min + y_max) / 2))
             for name, (x, y) in projection.items()
         }
-        for index, item in enumerate(self.members()):
+        for index, item in visible:
             a, b = item["a"], item["b"]
             if a not in mapped or b not in mapped:
                 continue
@@ -223,17 +233,53 @@ class ElementEditor(ttk.Frame):
                                fill="#2169a0" if selected else ("#617688" if item["kind"] == "rigid" else "#be6234"),
                                dash=(4, 2) if item["kind"] in DEFORMABLE_KINDS else (),
                                tags=("member", f"line:{index}"))
-        if "PUSH_OUT" in mapped and "PUSH_IN" in mapped:
-            if self.active_corner in self.rocker_corners:
-                canvas.create_line(*mapped["PUSH_OUT"], *mapped["PUSH_IN"], width=2, fill="#617688",
-                                   tags=("member", "line:rocker"))
-            else:
-                canvas.create_line(*mapped["PUSH_OUT"], *mapped["PUSH_IN"], width=2, fill="#be6234", dash=(4, 2))
+        rocker_points = ("ROCKER_A", "ROCKER_B", "ROCKER_CENTER", "PUSH_IN", "PUSH_OUT")
+        if all(name in mapped for name in rocker_points):
+            a, b, center, pin, pickup = (mapped[name] for name in rocker_points)
+            tags = ("member", "line:rocker")
+            color = "#2169a0" if self.selected == "rocker" else "#8060ac"
+            canvas.create_line(*a, *b, width=2, fill=color, dash=(4, 2), tags=tags)
+            canvas.create_line(*center, *pin, width=3, fill=color, tags=tags)
+            canvas.create_line(*pin, *pickup, width=3 if self.selected == "rocker" else 2,
+                               fill=color, tags=tags)
+            canvas.create_text((a[0] + b[0]) / 2, (a[1] + b[1]) / 2 + 8, text="搖臂",
+                               anchor="n", fill=color, tags=tags)
         if self.selected is not None:
             canvas.tag_raise(f"line:{self.selected}")
         for name, (x, y) in mapped.items():
+            if name == "ROCKER_CENTER":
+                continue
             canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#263848", outline="")
             canvas.create_text(x + 3, y - 3, text=name, anchor="sw", font=("TkDefaultFont", 7), fill="#354555")
+
+    def reset_preview(self):
+        self.preview_angles = (.67, .42)
+        self.draw()
+
+    def start_preview_drag(self, event):
+        self.preview_press = (event.x, event.y)
+        self.preview_drag = None
+
+    def rotate_preview(self, event):
+        if self.preview_press is not None:
+            x, y = self.preview_press
+            if (event.x - x)**2 + (event.y - y)**2 <= 16:
+                return
+            self.preview_drag = self.preview_press
+            self.preview_press = None
+        if self.preview_drag is not None:
+            x, y = self.preview_drag
+            azimuth, elevation = self.preview_angles
+            self.preview_angles = (azimuth + (event.x - x) * .012,
+                                   max(-1.55, min(1.55, elevation + (event.y - y) * .012)))
+            self.preview_drag = (event.x, event.y)
+            self.draw()
+
+    def finish_preview_drag(self, event):
+        press = self.preview_press
+        self.preview_press = self.preview_drag = None
+        if press is not None and (event.x - press[0])**2 + (event.y - press[1])**2 <= 16:
+            self.choose_line(event)
 
     def choose_line(self, event):
         canvas = self.preview

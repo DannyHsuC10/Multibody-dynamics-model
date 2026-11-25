@@ -9,7 +9,8 @@ from .animation import AnimationFrame
 from .deformable import DynamicsModel, sample_dampers, sample_element_springs, suspension_terms
 from .rocker import coupled_terms
 from .dynamics import MAX_INTEGRATION_STEP, MAX_STEPS, ramp_force, rk4_step, road_profile, sample_times
-from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_chassis_inertia, validate_lateral
+from .driving import DriveModel, DriveSample, steering_rack
+from .dynamics_settings import SIMULATION_LIMITS, bounded, require_fields, validate_chassis_inertia, validate_drive, validate_lateral
 from .heave import HeaveSample
 from .mount_loads import compute_mount_loads
 from .solver import CornerSolver, Unreachable, VehicleResult, WHEEL, WheelTravel
@@ -19,7 +20,8 @@ DISPLACEMENT = slice(0, 3)
 ORIENTATION = slice(3, 7)
 VELOCITY = slice(7, 10)
 OMEGA = slice(10, 13)
-WHEELS = slice(13, None)
+WHEELS = slice(13, 21)
+SPIN = slice(21, 25)
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,10 @@ class RigidBodySample:
     angular_acceleration: np.ndarray
     force_y: float = 0.
 
+    @property
+    def planar_speed(self):
+        return hypot(*self.velocity[:2])
+
 
 @dataclass(frozen=True)
 class _Evaluation:
@@ -44,8 +50,10 @@ class _Evaluation:
     tire_forces: np.ndarray
     road_heights: np.ndarray
     force_y: float
-    tire_forces_y: np.ndarray
+    tire_forces_xy: np.ndarray
     step_limit: float
+    spin_acceleration: np.ndarray | None = None
+    drive_sample: DriveSample | None = None
 
 
 def _rotation_matrix(quaternion):
@@ -75,7 +83,8 @@ def _rate_bound(response, coefficients):
 
 
 class _RigidChassisEquation:
-    def __init__(self, model, total_mass, inertia, target, amplitude, width, lateral_force=lambda _: 0.):
+    def __init__(self, model, total_mass, inertia, target, amplitude, width, lateral_force=lambda _: 0.,
+                 *, drive_settings=None):
         self.model = model
         self.solvers = tuple(CornerSolver(item) for item in model.geometry.corners)
         self.names = tuple(solver.geometry.name for solver in self.solvers)
@@ -86,8 +95,13 @@ class _RigidChassisEquation:
         if not isfinite(self.body_mass) or self.body_mass <= 0.:
             raise ValueError("車輛總質量須大於四輪輪端質量總和，才能求解剛體車身。")
         self.inertia = inertia
-        self.paths = tuple(solver.wheel_travel(0.) for solver in self.solvers)
-        hubs = np.array([path.position[WHEEL] for path in self.paths])
+        self.drive = None if drive_settings is None else DriveModel(drive_settings, model.geometry.corners)
+        front = tuple(solver for solver in self.solvers if solver.geometry.axle == "front")
+        rack = 0. if self.drive is None else steering_rack(front, drive_settings["steer_deg"])
+        self.racks = tuple(rack if solver.geometry.axle == "front" else 0. for solver in self.solvers)
+        self.paths = tuple(solver.wheel_travel(0., rack=position)
+                           for solver, position in zip(self.solvers, self.racks))
+        hubs = np.array([solver.reference[WHEEL] for solver in self.solvers])
         # The measured CG and static tire loads refer to the complete vehicle.
         # Removing the four wheel masses gives the CG of the sprung body.
         self.pivot = (total_mass * np.asarray(model.geometry.cg) - self.masses @ hubs) / self.body_mass
@@ -103,8 +117,9 @@ class _RigidChassisEquation:
     def evaluate(self, state, time):
         wheel_states = state[WHEELS].reshape(-1, 2)
         speeds = wheel_states[:, 1]
-        self.paths = tuple(solver.wheel_travel(travel, previous)
-                           for solver, (travel, _), previous in zip(self.solvers, wheel_states, self.paths))
+        self.paths = tuple(solver.wheel_travel(travel, previous, rack=rack)
+                           for solver, (travel, _), previous, rack
+                           in zip(self.solvers, wheel_states, self.paths, self.racks))
         rotation = _rotation_matrix(state[ORIENTATION])
         omega = state[OMEGA]
         offsets = (np.array([path.position[WHEEL] for path in self.paths]) - self.pivot) @ rotation.T
@@ -136,13 +151,26 @@ class _RigidChassisEquation:
         wheel_forces[:, 2] += tire_forces - self.masses * self.model.gravity
         force_y = self.lateral_force(time)
         normal_load = tire_forces.sum()
-        tire_forces_y = -force_y * (tire_forces / normal_load) if normal_load > 0. else np.zeros_like(tire_forces)
-        wheel_forces[:, 1] += tire_forces_y
+        horizontal = np.zeros_like(wheel_forces)
+        spin_acceleration = drive_sample = None
+        drive_step = MAX_INTEGRATION_STEP
+        if self.drive is None:
+            if normal_load > 0.:
+                horizontal[:, 1] = -force_y * (tire_forces / normal_load)
+        else:
+            axes = np.array([solver.wheel_axis_at(path.position) for solver, path in zip(self.solvers, self.paths)])
+            axes = axes @ rotation.T
+            horizontal, spin_acceleration, drive_sample, drive_step = self.drive.contact(
+                time, state[SPIN], axes, hub_velocity, tire_forces)
+        wheel_forces += horizontal
         rhs = np.einsum("ijk,ij->k", jacobian, wheel_forces)
         rhs[1] += force_y
-        # The lateral road reaction acts at ground level. Represent it by a
-        # force at the concentrated hub and the equivalent roll moment.
-        rhs[3] += (hub_heights - road_heights) @ tire_forces_y
+        # Move the horizontal contact force from the hub to ground level.
+        contact_height = hub_heights - road_heights
+        rhs[3] += contact_height @ horizontal[:, 1]
+        rhs[4] -= contact_height @ horizontal[:, 0]
+        if self.drive is not None:
+            rhs[3:6] -= self.drive.inertia * (spin_acceleration @ axes)
         rhs[2] -= self.body_mass * self.model.gravity
         rhs[3:6] -= np.cross(omega, ground_inertia @ omega)
         spring_rates, damping_rates = self.apply_suspension(rhs, speeds)
@@ -163,10 +191,10 @@ class _RigidChassisEquation:
         damping_rate = _rate_bound(response, np.concatenate((self.tire_dampings, damping_rates)))
         travel_rate = np.max(np.abs(speeds) + np.sqrt(.004 * np.abs(acceleration[6:])))
         rotation_rate = np.linalg.norm(omega) + sqrt(.05 * np.linalg.norm(acceleration[3:6]))
-        step_limit = min(MAX_INTEGRATION_STEP, .35 / sqrt(stiffness_rate), .7 / max(damping_rate, 1e-12),
+        step_limit = min(drive_step, .35 / sqrt(stiffness_rate), .7 / max(damping_rate, 1e-12),
                          .002 / max(travel_rate, 1e-12), .025 / max(rotation_rate, 1e-12))
         return _Evaluation(self.paths, rotation, acceleration, hub_accelerations, tire_forces, road_heights,
-                           force_y, tire_forces_y, step_limit)
+                           force_y, horizontal[:, :2], step_limit, spin_acceleration, drive_sample)
 
     def acceleration_jacobians(self, offsets, tangents):
         """Map chassis linear/angular acceleration and wheel travel acceleration to each hub."""
@@ -214,7 +242,7 @@ class _RigidChassisEquation:
         rotation = evaluation.rotation
         mount_loads = compute_mount_loads(self.model, result, dampers, 0., rotation=rotation,
                                           wheel_accelerations=dict(zip(self.names, evaluation.hub_accelerations)),
-                                          tire_forces_y=dict(zip(self.names, evaluation.tire_forces_y)))
+                                          tire_forces_xy=dict(zip(self.names, evaluation.tire_forces_xy)))
         body = RigidBodySample(
             state[DISPLACEMENT].copy(), state[VELOCITY].copy(), acceleration[:3].copy(),
             _angles_deg(rotation), state[OMEGA].copy(), acceleration[3:6].copy(), evaluation.force_y,
@@ -225,7 +253,8 @@ class _RigidChassisEquation:
         heave = HeaveSample(float(body.displacement[2]), float(body.velocity[2]), float(body.acceleration[2]), 0.)
         return AnimationFrame(time, result, rotation, self.pivot, body.displacement, dampers=dampers,
                               heave=heave, mount_loads=mount_loads, body=body,
-                              element_springs=sample_element_springs(self.model, result))
+                              element_springs=sample_element_springs(self.model, result),
+                              drive=evaluation.drive_sample)
 
 
 def _rates(state, evaluation):
@@ -240,6 +269,8 @@ def _rates(state, evaluation):
     derivative[4:7] = .5 * (real * omega + np.cross(omega, vector))
     derivative[WHEELS] = np.column_stack((state[WHEELS].reshape(-1, 2)[:, 1],
                                          evaluation.acceleration[6:])).ravel()
+    if evaluation.spin_acceleration is not None:
+        derivative[SPIN] = evaluation.spin_acceleration
     return derivative
 
 
@@ -272,9 +303,19 @@ def _inertia(settings):
     return np.array([inertia[key] for key in ("ixx", "iyy", "izz")])
 
 
+def simulate_rigid_drive(model: DynamicsModel, settings: dict, total_mass: float) -> tuple[AnimationFrame, ...]:
+    drive = validate_drive(settings.get("drive"))
+    equation = _RigidChassisEquation(model, total_mass, _inertia(settings), "all", 0., .25,
+                                     drive_settings=drive)
+    return _integrate(equation, drive["duration_seconds"], .25, (.25,))
+
+
 def _integrate(equation, duration, input_window, checkpoints):
-    state = np.zeros(13 + 2 * len(equation.solvers))
+    state = np.zeros(21 if equation.drive is None else 25)
     state[3] = 1.
+    if equation.drive is not None:
+        state[7] = equation.drive.initial_speed
+        state[SPIN] = equation.drive.initial_speed / equation.drive.radius
     frames = []
     current = 0.
     steps = 0

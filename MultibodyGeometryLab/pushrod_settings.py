@@ -6,6 +6,7 @@ import numpy as np
 
 from ._geometry_support.hardpoints import CORNERS, _coordinate
 from .dynamics_settings import bounded, require_fields
+from .hydraulic_circuits import validate_cylinder
 
 
 OUTBOARD = ("LCA", "UCA", "UPRIGHT")
@@ -19,6 +20,10 @@ def validate_force(record):
         record.setdefault(key, default)
     if record["kind"] not in ("spring_damper", "hydraulic"):
         raise ValueError("變形元件須為彈簧阻尼或液壓缸。")
+    if "hydraulic" in record:
+        if record["kind"] != "hydraulic":
+            raise ValueError("只有液壓缸可設定油口。")
+        record["hydraulic"] = validate_cylinder(record["hydraulic"])
     for key, label, low, high in (("spring_n_m", "彈簧剛性 (N/m)", 0., 500_000.),
                                   ("damper_ns_m", "阻尼 (N·s/m)", 0., 5000.),
                                   ("hydraulic_force_n", "液壓缸軸力 (N)", -100_000., 100_000.)):
@@ -38,8 +43,9 @@ def validate_pushrods(records):
         axes = AXIS_POINTS if mode == "rocker" else ()
         if mode == "body":
             validate_force(record)
+        force_fields = (*COEFFICIENTS, "hydraulic") if "hydraulic" in record else tuple(COEFFICIENTS)
         require_fields(record, ("inboard", "outboard", "PUSH_IN", "PUSH_OUT",
-                                *(axes or COEFFICIENTS)), f"{name} · 推桿")
+                                *(axes or force_fields)), f"{name} · 推桿")
         if record["outboard"] not in OUTBOARD:
             raise ValueError(f"{name} · 推桿輪端須連接下 A 臂、上 A 臂或 upright。")
         for key in ("PUSH_IN", "PUSH_OUT", *axes):

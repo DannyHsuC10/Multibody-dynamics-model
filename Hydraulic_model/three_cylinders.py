@@ -3,10 +3,10 @@
 import argparse
 
 if __package__:
-    from .model import GROUND, HydraulicCylinder, LinearSpring, SpringElement
+    from .model import CHASSIS, HydraulicCylinder, LinearSpring, SpringElement
     from .static_network import PressureLine, StaticHydraulicSystem
 else:
-    from model import GROUND, HydraulicCylinder, LinearSpring, SpringElement
+    from model import CHASSIS, HydraulicCylinder, LinearSpring, SpringElement
     from static_network import PressureLine, StaticHydraulicSystem
 
 
@@ -59,7 +59,7 @@ def main():
         a, b, c = cylinders
         p1 = PressureLine("P1", tuple(cylinder.cap_end for cylinder in cylinders))
         p2 = PressureLine("P2", tuple(cylinder.rod_end for cylinder in cylinders))
-        spring = SpringElement(LinearSpring(args.spring_n_mm), c.rod, GROUND)
+        spring = SpringElement(LinearSpring(args.spring_n_mm), c.rod, CHASSIS)
         system = StaticHydraulicSystem((p1, p2), springs=(spring,))
         result = system.solve({a.rod: -args.f1_n, b.rod: -args.f2_n})
     except ValueError as error:

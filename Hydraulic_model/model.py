@@ -35,26 +35,34 @@ class LinearSpring:
 
 
 @dataclass(frozen=True)
-class MechanicalGround:
-    """A fixed mechanical reference with zero displacement."""
+class ChassisMount:
+    """A fixed connection point in the vehicle chassis frame."""
 
 
-GROUND = MechanicalGround()
+CHASSIS = ChassisMount()
+# Keep older Python models working with the same fixed reference.
+MechanicalGround = ChassisMount
+GROUND = CHASSIS
 
 
 @dataclass(frozen=True)
 class SpringElement:
-    """An unloaded linear spring connecting two mechanical points at rest."""
+    """A two-terminal linear spring and viscous damper in parallel."""
 
-    spring: LinearSpring
-    end_a: PistonRod | MechanicalGround
-    end_b: PistonRod | MechanicalGround
+    spring: LinearSpring | None
+    end_a: PistonRod | ChassisMount
+    end_b: PistonRod | ChassisMount
+    damping_n_s_mm: float = 0.
 
     def __post_init__(self):
-        if not all(isinstance(end, (PistonRod, MechanicalGround)) for end in (self.end_a, self.end_b)):
-            raise ValueError("Spring endpoints must be piston rods or mechanical ground.")
+        if not all(isinstance(end, (PistonRod, ChassisMount)) for end in (self.end_a, self.end_b)):
+            raise ValueError("Spring endpoints must be piston rods or a chassis mount.")
         if self.end_a == self.end_b:
             raise ValueError("A spring must connect two distinct mechanical points.")
+        if not isfinite(self.damping_n_s_mm) or self.damping_n_s_mm < 0.:
+            raise ValueError("Damper coefficient must be finite and nonnegative.")
+        if self.spring is None and self.damping_n_s_mm == 0.:
+            raise ValueError("The element needs spring stiffness or damping.")
 
 
 @dataclass(frozen=True)

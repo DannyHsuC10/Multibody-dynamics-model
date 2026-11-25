@@ -372,7 +372,7 @@
       "torque_nm": 15.0,
       "steer_deg": 3.0,
       "initial_speed_m_s": 2.0,
-      "gear_ratio": 4.0,
+      "gear_ratio": 11.2,
       "gear_efficiency": 0.95,
       "wheel_inertia": 0.45,
       "duration_seconds": 2.5

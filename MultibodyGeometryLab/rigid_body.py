@@ -84,7 +84,7 @@ def _rate_bound(response, coefficients):
 
 class _RigidChassisEquation:
     def __init__(self, model, total_mass, inertia, target, amplitude, width, lateral_force=lambda _: 0.,
-                 *, drive_settings=None):
+                 *, hold_heading=False, drive_settings=None):
         self.model = model
         self.solvers = tuple(CornerSolver(item) for item in model.geometry.corners)
         self.names = tuple(solver.geometry.name for solver in self.solvers)
@@ -109,6 +109,7 @@ class _RigidChassisEquation:
         self.amplitudes = np.array([amplitude if target in (name, "all") else 0. for name in self.names])
         self.width = width
         self.lateral_force = lateral_force
+        self.hold_heading = hold_heading
         self.wheel_columns = 6 + np.arange(len(self.names))
         self.force_rows = np.eye(6 + len(self.names))[6:]
         self.tire_stiffnesses = np.full(len(self.names), model.tire_stiffness)
@@ -178,10 +179,32 @@ class _RigidChassisEquation:
         # The mass-normalized stiffness and damping eigenvalues are bounded
         # by the absolute row sums of their matrices in force coordinates.
         contact_and_spring = np.vstack((jacobian[:, 2, :], self.force_rows))
+        loads = np.column_stack((rhs, contact_and_spring.T))
+        if self.hold_heading:
+            yaw_distribution = self.yaw_distribution(offsets[:, 0], tire_forces, normal_load)
+            yaw_load = jacobian[:, 1, :].T @ yaw_distribution
+            yaw_load[3] += contact_height @ yaw_distribution
+            loads = np.column_stack((loads, yaw_load))
         try:
-            solutions = np.linalg.solve(mass_matrix, np.column_stack((rhs, contact_and_spring.T)))
+            solutions = np.linalg.solve(mass_matrix, loads)
         except np.linalg.LinAlgError as error:
             raise Unreachable("車身與懸吊的質量矩陣無法求解。") from error
+        if self.hold_heading:
+            # The chassis forward axis remains in the ground X–Z plane.
+            # Its Y acceleration is (alpha × forward + omega × (omega × forward)).y.
+            forward = rotation[:, 0]
+            heading_jacobian = np.cross(forward, [0., 1., 0.])
+            heading_bias = np.cross(omega, np.cross(omega, forward))[1]
+            yaw_response = solutions[:, -1]
+            effectiveness = heading_jacobian @ yaw_response[3:6]
+            if abs(effectiveness) <= 1e-12:
+                raise Unreachable("輪胎側向反力無法維持車頭方向。")
+            solutions = solutions[:, :-1]
+            heading_rate_change = heading_jacobian @ solutions[3:6]
+            heading_rate_change[0] += heading_bias
+            correction = -heading_rate_change / effectiveness
+            solutions = solutions + np.outer(yaw_response, correction)
+            horizontal[:, 1] += yaw_distribution * correction[0]
         acceleration = solutions[:, 0]
         if not np.isfinite(acceleration).all():
             raise Unreachable("車身或輪心加速度超出數值範圍。")
@@ -195,6 +218,31 @@ class _RigidChassisEquation:
                          .002 / max(travel_rate, 1e-12), .025 / max(rotation_rate, 1e-12))
         return _Evaluation(self.paths, rotation, acceleration, hub_accelerations, tire_forces, road_heights,
                            force_y, horizontal[:, :2], step_limit, spin_acceleration, drive_sample)
+
+    @staticmethod
+    def yaw_distribution(positions_x, tire_forces, normal_load):
+        """Distribute a unit ground yaw moment with zero net added lateral force."""
+        if normal_load <= 0.:
+            raise Unreachable("輪胎離地，無法分配維持車頭方向的側向反力。")
+        shares = tire_forces / normal_load
+        lever = positions_x - shares @ positions_x
+        spread = shares @ (lever * lever)
+        if spread <= 1e-10:
+            raise Unreachable("接地輪胎的縱向力臂不足，無法平衡側向力矩。")
+        return shares * lever / spread
+
+    def enforce_heading(self, state):
+        """Remove numerical drift in heading and its first derivative."""
+        quaternion = state[ORIENTATION]
+        forward = _rotation_matrix(quaternion)[:, 0]
+        half_yaw = .5 * atan2(forward[1], forward[0])
+        w, x, y, z = quaternion.copy()
+        c, s = np.cos(half_yaw), np.sin(half_yaw)
+        quaternion[:] = [c*w + s*z, c*x + s*y, c*y - s*x, c*z - s*w]
+        horizontal = hypot(forward[0], forward[1])
+        if horizontal <= 1e-8:
+            raise Unreachable("車頭方向接近垂直，無法維持偏航角。")
+        state[OMEGA][2] = forward[2] / horizontal * state[OMEGA][0]
 
     def acceleration_jacobians(self, offsets, tangents):
         """Map chassis linear/angular acceleration and wheel travel acceleration to each hub."""
@@ -290,11 +338,11 @@ def simulate_rigid_road(model: DynamicsModel, settings: dict, total_mass: float)
 
 
 def simulate_rigid_lateral(model: DynamicsModel, settings: dict, total_mass: float) -> tuple[AnimationFrame, ...]:
-    """Apply a held lateral force at the sprung CG on flat, gripping ground."""
+    """Apply a held lateral force at the sprung CG while maintaining heading."""
     lateral = validate_lateral(settings.get("lateral") if isinstance(settings, dict) else None)
     force, ramp, duration = (lateral[key] for key in ("force_y_n", "ramp_seconds", "duration_seconds"))
     equation = _RigidChassisEquation(model, total_mass, _inertia(settings), "all", 0., ramp,
-                                     lambda time: ramp_force(time, force, ramp))
+                                     lambda time: ramp_force(time, force, ramp), hold_heading=True)
     return _integrate(equation, duration, ramp, (ramp,))
 
 
@@ -330,6 +378,8 @@ def _integrate(equation, duration, input_window, checkpoints):
                 step = min(output - current, step_limit)
                 state = rk4_step(equation.rates, state, current, step, _rates(state, evaluation))
                 state[ORIENTATION] /= np.linalg.norm(state[ORIENTATION])
+                if equation.hold_heading:
+                    equation.enforce_heading(state)
                 current += step
                 steps += 1
                 evaluation = equation.evaluate(state, current)

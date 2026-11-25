@@ -37,7 +37,7 @@ INERTIA_LIMITS = {
     "izz": ("Izz · 偏航", .01, 1_000_000.),
 }
 DRIVE_LIMITS = {
-    "torque_nm": ("馬達扭矩指令 (N·m)", 0., 1000.),
+    "torque_nm": ("每顆馬達扭矩指令 (N·m)", 0., 1000.),
     "steer_deg": ("前輪平均轉角 (°)", -30., 30.),
     "initial_speed_m_s": ("初始車速 (m/s)", 0., 50.),
     "gear_ratio": ("減速比", 1., 20.),
@@ -49,7 +49,7 @@ DRIVE_LIMITS = {
 
 def default_drive():
     return {"torque_nm": 15., "steer_deg": 3., "initial_speed_m_s": 2.,
-            "gear_ratio": 4., "gear_efficiency": .95, "wheel_inertia": .45, "duration_seconds": 2.5}
+            "gear_ratio": 11.2, "gear_efficiency": .95, "wheel_inertia": .45, "duration_seconds": 2.5}
 
 
 def validate_drive(data):

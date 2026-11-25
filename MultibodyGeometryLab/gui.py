@@ -29,6 +29,7 @@ from .project import (COMPONENTS, DRIVERS, default_project, read_project,
 from .rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road
 from .signal_plot import MOUNT_LABELS, SignalView
 from .solver import Unreachable, VehicleResult, solve_vehicle
+from .vehicle_telemetry import VehicleTelemetryView, vehicle_readings
 from .viewport import MechanismView
 from .widgets import ScrollFrame
 
@@ -118,6 +119,7 @@ class Workbench(ttk.Frame):
         self.revision = 0
         self.animation_job = None
         self.signal_window = self.signal_view = None
+        self.telemetry_window = self.telemetry_view = None
         self.data = None
         self.edit_base = None
         self.edit_history = []
@@ -139,6 +141,8 @@ class Workbench(ttk.Frame):
         self.status = tk.StringVar()
         self.result_label = tk.StringVar()
         self.angular_label = tk.StringVar()
+        self.vehicle_motion_label = tk.StringVar()
+        self.wheel_load_label = tk.StringVar()
 
         root.title("雙 A 臂多體幾何工作台")
         root.geometry("1360x840")
@@ -429,10 +433,12 @@ class Workbench(ttk.Frame):
         projection.pack(side="right")
         projection.bind("<<ComboboxSelected>>", lambda _event: self.viewport.change_view(projection.get()))
         ttk.Button(bar, text="2D 訊號圖", command=self.open_signal_view).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="車輛時序圖", command=self.open_vehicle_telemetry).pack(side="right", padx=(0, 6))
         self.viewport = MechanismView(parent, self.select_hardpoint)
         self.viewport.pack(fill="both", expand=True)
         self.player = AnimationPlayer(parent, self.refresh_results)
         self.player.pack(fill="x", pady=(6, 0))
+        self.add_telemetry_readouts(parent)
 
         bar = ttk.Frame(parent)
         bar.pack(fill="x", pady=(8, 4))
@@ -495,6 +501,34 @@ class Workbench(ttk.Frame):
     def close_signal_view(self):
         self.signal_window.destroy()
         self.signal_window = self.signal_view = None
+
+    def add_telemetry_readouts(self, parent):
+        ttk.Label(parent, textvariable=self.vehicle_motion_label, padding=(2, 5, 0, 0)).pack(anchor="w")
+        ttk.Label(parent, textvariable=self.wheel_load_label, padding=(2, 1, 0, 0)).pack(anchor="w")
+
+    def open_vehicle_telemetry(self):
+        if self.telemetry_window is not None:
+            self.telemetry_window.deiconify()
+            self.telemetry_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("車輛時序圖")
+        window.geometry("940x610")
+        window.minsize(660, 430)
+        readouts = ttk.Frame(window, padding=(10, 4, 10, 8))
+        readouts.pack(fill="x")
+        self.add_telemetry_readouts(readouts)
+        self.telemetry_window = window
+        self.telemetry_view = VehicleTelemetryView(window, self.player.seek_time)
+        self.telemetry_view.pack(fill="both", expand=True)
+        self.telemetry_view.set_frames(self.player.frames)
+        frame = self.player.frame
+        self.telemetry_view.set_time(frame.time if frame is not None else None)
+        window.protocol("WM_DELETE_WINDOW", self.close_vehicle_telemetry)
+
+    def close_vehicle_telemetry(self):
+        self.telemetry_window.destroy()
+        self.telemetry_window = self.telemetry_view = None
 
     def toggle_hardpoints(self):
         if self.hardpoint_mode.get() and self.hardpoint_draft is None and not self.generate_hardpoints():
@@ -701,7 +735,7 @@ class Workbench(ttk.Frame):
         zero = {name: dict.fromkeys(COMPONENTS, 0.) for name in DRIVERS}
         neutral = solve_vehicle(model, zero)
         rocker_states(model, neutral.corners)
-        neutral_dampers = sample_dampers(dynamics, neutral)
+        neutral_dampers = sample_dampers(dynamics, neutral, road={})
         neutral_springs = sample_element_springs(dynamics, neutral)
         return PreparedModel(model, dynamics, neutral, neutral_dampers, neutral_springs=neutral_springs)
 
@@ -942,6 +976,18 @@ class Workbench(ttk.Frame):
             return
         self.refresh_hydraulic_response()
         dampers = frame.dampers if frame is not None else self.neutral_dampers
+        (roll, pitch), loads, (speed,), acceleration = vehicle_readings(frame, dampers)
+        clock = "靜態" if frame is None else f"{frame.time:.2f} s"
+        displayed_speed = f"{speed:.2f}" if np.isfinite(speed) else "—"
+        displayed_accel = ", ".join(f"{value:+.2f}" if np.isfinite(value) else "—" for value in acceleration)
+        self.vehicle_motion_label.set(f"{clock}   Roll {roll:+.2f}°   Pitch {pitch:+.2f}°   "
+                                      f"車速 {displayed_speed} km/h   加速度 XYZ ({displayed_accel}) m/s²")
+        wheel_loads = [f"{load:.1f}" if np.isfinite(load) else "—" for load in loads]
+        self.wheel_load_label.set("正向輪荷 (N)   " + "    ".join(
+            f"{name} {load}" for name, load in zip(hardpoints.CORNERS, wheel_loads)))
+        if self.telemetry_view is not None:
+            self.telemetry_view.set_frames(self.player.frames)
+            self.telemetry_view.set_time(frame.time if frame is not None else None)
         springs = frame.element_springs if frame is not None else self.neutral_springs
         rocker_readings = {name: reading for readings in (springs or {}).values()
                            for name, reading in readings.items() if reading.endpoints is not None}

@@ -1,4 +1,4 @@
-"""Tk canvas for the mechanism with a stationary ground reference."""
+"""Tk canvas for the mechanism, ground grid and driven trajectory."""
 
 import tkinter as tk
 import numpy as np
@@ -127,12 +127,31 @@ class MechanismView(tk.Canvas):
         x0 = min(c.reference[INDEX["WC"]][0] for c in self.model.corners) - .30
         road_half_width = max(.8, *(abs(c.reference[INDEX["WC"]][1]) + c.wheel_width / 2 + .08
                                      for c in self.model.corners))
-        for y in np.linspace(-road_half_width, road_half_width, 9):
-            add([(x0, y, 0), (.35, y, 0)], "#253a4c")
-        for x in np.linspace(x0, .35, 11):
-            add([(x, -road_half_width, 0), (x, road_half_width, 0)], "#253a4c")
-        add([(x0, 0., 0.), (.35, 0., 0.)], "#5c7085", dash=(4, 5))
-        ground_segment_count = len(segments)
+        driving = self.frame is not None and self.frame.drive is not None
+        ground_bounds = np.array([(x, y, 0.) for x in (x0, .35) for y in (-road_half_width, road_half_width)])
+        if driving:
+            dx, dy = self.frame.translation[:2]
+            # The follow camera subtracts the car's XY translation from the fixed world grid.
+            lower = (x0 - .8, -road_half_width - .6, 0.)
+            upper = (1.15, road_half_width + .6, 0.)
+            spacing = .30
+            for axis, offset in enumerate((dx, dy)):
+                first = int(np.ceil((lower[axis] + offset) / spacing))
+                last = int(np.floor((upper[axis] + offset) / spacing))
+                for index in range(first, last + 1):
+                    line = np.array([lower, upper])
+                    line[:, axis] = index * spacing - offset
+                    add(line, "#536c82" if index % 5 == 0 else "#31485d")
+            path = [item.translation[:2] for item in self.drive_frames if item.time <= self.frame.time]
+            if len(path) > 1:
+                local = np.asarray(path) - [dx, dy] + self.frame.pivot[:2]
+                add(np.column_stack((local, np.zeros(len(local)))), "#65d5bd", 2.5)
+        else:
+            for y in np.linspace(-road_half_width, road_half_width, 9):
+                add([(x0, y, 0), (.35, y, 0)], "#253a4c")
+            for x in np.linspace(x0, .35, 11):
+                add([(x, -road_half_width, 0), (x, road_half_width, 0)], "#253a4c")
+            add([(x0, 0., 0.), (.35, 0., 0.)], "#5c7085", dash=(4, 5))
         for corner in self.model.corners:
             element = self.dampers.get(corner.name)
             if element is not None and element.road_height:
@@ -221,9 +240,8 @@ class MechanismView(tk.Canvas):
                     translation = (0., 0., translation[2])
                 return (np.asarray(points) - frame.pivot) @ frame.rotation.T + frame.pivot + translation
 
-            # Fit once to the neutral geometry in the current view, so the
-            # ground does not pan or zoom as the frame changes.
-            anchors = [points for points, *_ in segments[:ground_segment_count]]
+            # Fit to the neutral vehicle and nominal ground patch, independent of trajectory length.
+            anchors = [ground_bounds]
             anchors.extend(np.asarray(edge) for edge in self.model.chassis_edges)
             for corner in self.model.corners:
                 center = np.asarray(corner.reference[INDEX["WC"]])
@@ -275,7 +293,7 @@ class MechanismView(tk.Canvas):
                 if self.frame.drive is not None:
                     drive = self.frame.drive
                     readout += (f"\n車速 {body.planar_speed * 3.6:.1f} km/h"
-                                f"    馬達 {drive.motor_torque_nm:.1f} N·m / {drive.motor_rpm:.0f} rpm")
+                                f"    四馬達平均 {drive.motor_torque_nm:.1f} N·m / {drive.motor_rpm:.0f} rpm")
             elif heave is not None:
                 readout = (f"重心 ΔZ {heave.displacement * 1000:+.1f} mm    "
                            f"重心外力 Fz {heave.force_z:+.0f} N    (+Z 向上)")

@@ -102,6 +102,7 @@ class RigidBodyTests(unittest.TestCase):
     def test_lateral_cg_force_ramps_and_transfers_load_between_sides(self):
         total_mass = self.vehicle["mass"]
         sprung_mass = total_mass - sum(spec.mass for spec in self.model.corners.values())
+        inertia = np.diag([INERTIA[axis] for axis in ("ixx", "iyy", "izz")])
         for force in (600., -600.):
             with self.subTest(force=force):
                 settings = {**self.settings, "lateral": {
@@ -119,8 +120,25 @@ class RigidBodyTests(unittest.TestCase):
                 self.assertGreater(force * (left - right), 0.)
                 mount_force_y = sum(load.total[1] for load in end.mount_loads.values())
                 self.assertAlmostEqual(force + mount_force_y, sprung_mass * end.body.acceleration[1], places=5)
+                for frame in frames:
+                    self.assertAlmostEqual(frame.body.angles_deg[2], 0., places=10)
+                    forward = frame.rotation[:, 0]
+                    omega = frame.body.angular_velocity
+                    alpha = frame.body.angular_acceleration
+                    self.assertAlmostEqual(np.cross(omega, forward)[1], 0., places=10)
+                    self.assertAlmostEqual(
+                        (np.cross(alpha, forward) + np.cross(omega, np.cross(omega, forward)))[1], 0., places=10)
+                    torque_z = 0.
+                    for name, load in frame.mount_loads.items():
+                        for mount, reaction in load.by_mount.items():
+                            point = (frame.dampers[name].fixed_point if mount == "DAMPER"
+                                     else frame.result.corners[name].position[POINTS.index(mount)])
+                            torque_z += np.cross(frame.rotation @ (point - frame.pivot), reaction)[2]
+                    world_inertia = frame.rotation @ inertia @ frame.rotation.T
+                    momentum_rate = world_inertia @ alpha + np.cross(omega, world_inertia @ omega)
+                    self.assertAlmostEqual(torque_z, momentum_rate[2], places=5)
 
-    def test_motor_launch_turns_and_respects_the_rear_axle_and_torque_curve(self):
+    def test_four_motor_launch_turns_and_limits_torque_at_each_wheel(self):
         settings = {**self.settings, "drive": {
             **self.settings["drive"], "steer_deg": 3., "initial_speed_m_s": 0.,
             "torque_nm": 100., "duration_seconds": .5,
@@ -131,11 +149,13 @@ class RigidBodyTests(unittest.TestCase):
         self.assertGreater(end.body.planar_speed, .2)
         self.assertGreater(end.body.displacement[1], 0.)
         self.assertGreater(end.body.angles_deg[2], 0.)
-        self.assertGreater(end.drive.motor_torque_nm, 0.)
-        self.assertLess(end.drive.motor_torque_nm, 22.31)
-        np.testing.assert_array_equal(end.drive.wheel_torque_nm[:2], 0.)
-        self.assertAlmostEqual(end.drive.wheel_torque_nm[2], end.drive.wheel_torque_nm[3])
-        self.assertGreater(end.drive.fx[2:].sum(), 0.)
+        drive = end.drive
+        self.assertEqual(settings["drive"]["gear_ratio"], 11.2)
+        self.assertTrue(np.all((drive.motor_torque_by_wheel_nm > 0.) & (drive.motor_torque_by_wheel_nm < 22.31)))
+        self.assertGreater(np.ptp(drive.motor_torque_by_wheel_nm), 1e-3)
+        np.testing.assert_allclose(drive.motor_rpm_by_wheel, np.abs(drive.wheel_speed_rad_s) * 11.2 * 60 / (2 * np.pi))
+        np.testing.assert_allclose(drive.wheel_torque_nm, drive.motor_torque_by_wheel_nm * 11.2 * settings["drive"]["gear_efficiency"])
+        self.assertTrue(np.all(drive.fx > 0.))
 
 
 if __name__ == "__main__":

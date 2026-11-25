@@ -96,7 +96,7 @@ class LateralEditor(_CGForceEditor):
     validate = staticmethod(validate_lateral)
     description = "平坦地面 · 簧上重心沿 Y 方向受力"
     directions = "正值向左施力，負值向右。"
-    note = "地面側向反力依各輪正向輪荷分配，適用於抓地條件下的側傾分析。"
+    note = "由接地輪胎分擔側向反力，聯立 Fy 與 Mz 維持車頭方向，並計算側傾與輪荷轉移。"
     button_label = "模擬重心側向力"
 
 
@@ -108,7 +108,7 @@ class DriveEditor(ttk.Frame):
             variable = self.fields[key]
             variable.trace_add("write", mark_dirty)
             add_entry(self, row, label, variable)
-        ttk.Label(self, text="單馬達後驅 · Hoosier W8 Pacejka 輪胎。正轉角向左，齒條在模擬期間固定。",
+        ttk.Label(self, text="四輪輪內馬達 · 各馬達依各輪輪速限扭。正轉角向左，齒條在模擬期間固定。",
                   wraplength=312).grid(row=len(self.fields), columnspan=2, sticky="w", pady=8)
         self.start_button = ttk.Button(self, text="模擬馬達行駛", command=start)
         self.start_button.grid(row=len(self.fields) + 1, columnspan=2, sticky="ew")

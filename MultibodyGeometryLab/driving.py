@@ -1,4 +1,4 @@
-"""Pacejka contact and a single motor with an equal-torque rear differential."""
+"""Pacejka contact and four independently speed-limited in-wheel motors."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,14 +11,22 @@ from .solver import Unreachable
 
 @dataclass(frozen=True)
 class DriveSample:
-    motor_torque_nm: float
-    motor_rpm: float
+    motor_torque_by_wheel_nm: np.ndarray
+    motor_rpm_by_wheel: np.ndarray
     wheel_torque_nm: np.ndarray
     wheel_speed_rad_s: np.ndarray
     fx: np.ndarray
     fy: np.ndarray
     slip_ratio: np.ndarray
     slip_angle_deg: np.ndarray
+
+    @property
+    def motor_torque_nm(self):
+        return float(np.mean(self.motor_torque_by_wheel_nm))
+
+    @property
+    def motor_rpm(self):
+        return float(np.mean(self.motor_rpm_by_wheel))
 
 
 def steering_rack(solvers, target_deg):
@@ -59,12 +67,10 @@ class DriveModel:
             raise ValueError("馬達行駛需要同一專案中的 Motor 與 Pacejka_tire_model。") from error
 
         self.api = api
-        self.to_wheel_torque = motor.wheel_outputforce_omega
         self.params = api.load_tir("Hoosier_43075_R20_W8_candidate.tir")
         curve_path = Path(motor.__file__).with_name("motor_speed_vs_torque.csv")
         self.rpm, torque = np.loadtxt(curve_path, delimiter=",", skiprows=1, unpack=True)
         self.torque_limit = np.maximum(torque, 0.)
-        self.rear = np.array([corner.axle == "rear" for corner in corners])
         self.mirror = np.array([1. if corner.name.endswith("L") else -1. for corner in corners])
         self.radius = np.array([corner.wheel_radius for corner in corners])
         self.command = settings["torque_nm"]
@@ -104,17 +110,14 @@ class DriveModel:
         contact_scale *= np.minimum(np.maximum.reduce((abs(vx), abs(vy), abs(rolling))), 1.)
         fx = self.api.calculate_fx(condition) * contact_scale
         fy = self.api.calculate_fy(condition) * self.mirror * contact_scale
-        axle_speed = float(np.mean(wheel_speed[self.rear]))
-        rpm = abs(axle_speed) * self.train_rate * 60 / (2 * np.pi)
+        rpm = np.abs(wheel_speed) * self.train_rate * 60 / (2 * np.pi)
         torque_limit = self.get_motor_torque_data(rpm)
-        torque = min(ramp_force(time, self.command, .25), torque_limit)
-        available = float(self.to_wheel_torque(axle_speed, self))
-        axle_torque = available * (torque / torque_limit) if torque_limit > 0. else 0.
-        wheel_torque = self.rear * (axle_torque / self.rear.sum())
+        torque = np.minimum(ramp_force(time, self.command, .25), torque_limit)
+        wheel_torque = torque * self.train_rate * self.gear_eta
         wheel_acceleration = (wheel_torque - self.radius * fx) / self.inertia
         horizontal = fx[:, None] * forward + fy[:, None] * lateral
         spin_rate = self.slip_stiffness * (normal_load / p["FNOMIN"]) * self.radius**2 / (self.inertia * slip_speed)
         step_limit = min(.002, 1. / max(float(np.max(spin_rate)), 1.))
-        sample = DriveSample(float(torque), float(rpm), wheel_torque, wheel_speed.copy(),
+        sample = DriveSample(torque, rpm, wheel_torque, wheel_speed.copy(),
                              fx, fy, kappa, np.degrees(alpha))
         return horizontal, wheel_acceleration, sample, step_limit

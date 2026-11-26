@@ -61,6 +61,7 @@ class WheelTravel:
     curvature: np.ndarray
     jacobian: np.ndarray
     condition: float
+    rack_column: np.ndarray | None = None
 
 
 class CornerSolver:
@@ -194,7 +195,7 @@ class CornerSolver:
                 fraction = step / steps
                 q = self._position_step(q, start + (travel - start) * fraction,
                                         start_rack + (rack - start_rack) * fraction, VERTICAL)
-            points, _, jacobian, _ = self.equations(q, travel, rack)
+            points, _, jacobian, rack_column = self.equations(q, travel, rack)
             condition = self._condition(jacobian)
             tangent = np.zeros_like(points)
             rhs = np.zeros(len(jacobian))
@@ -208,9 +209,9 @@ class CornerSolver:
             curvature[N_FIXED:] = self._linear_solve(jacobian, rhs).reshape(-1, 3)
         except (Unreachable, np.linalg.LinAlgError) as error:
             raise Unreachable(f"{self.geometry.name} · 無法求解輪心行程 {travel * 1000:.2f} mm。{error}") from error
-        for array in (points, tangent, curvature, jacobian):
+        for array in (points, tangent, curvature, jacobian, rack_column):
             array.setflags(write=False)
-        return WheelTravel(travel, points, tangent, curvature, jacobian, condition)
+        return WheelTravel(travel, points, tangent, curvature, jacobian, condition, rack_column)
 
     def _locked_travel(self):
         points, _, jacobian, _ = self.equations(self.reference[N_FIXED:].ravel(), 0., 0.)
@@ -220,10 +221,29 @@ class CornerSolver:
             array.setflags(write=False)
         return WheelTravel(0., points, zeros, zeros, jacobian, condition)
 
-    def wheel_result(self, sample, travel_rate, travel_acceleration):
-        """Reconstruct the full node and rod state using the solved path derivatives."""
+    def wheel_motion(self, sample, travel_rate, rack_rate=0., rack_acceleration=0.):
+        """Return node velocity and acceleration bias with the rack prescribed."""
         velocity = sample.tangent * travel_rate
-        acceleration = sample.tangent * travel_acceleration + sample.curvature * travel_rate**2
+        if not rack_rate and not rack_acceleration:
+            return velocity, sample.curvature * travel_rate**2
+        jacobian = sample.jacobian
+        try:
+            velocity[RACK, 1] = rack_rate
+            velocity[N_FIXED:] += self._linear_solve(jacobian, -sample.rack_column * rack_rate).reshape(-1, 3)
+            relative = self._rigid_relative_rates(velocity)
+            rhs = -sample.rack_column * rack_acceleration
+            rhs[:-1] -= np.einsum("ij,ij->i", relative, relative) / self.rigid_lengths
+            bias = np.zeros_like(velocity)
+            bias[RACK, 1] = rack_acceleration
+            bias[N_FIXED:] = self._linear_solve(jacobian, rhs).reshape(-1, 3)
+        except (Unreachable, np.linalg.LinAlgError) as error:
+            raise Unreachable(f"{self.geometry.name} · 無法求解齒條速度或加速度。{error}") from error
+        return velocity, bias
+
+    def wheel_result(self, sample, travel_rate, travel_acceleration, *, motion=None):
+        """Reconstruct the full node and rod state using the solved path derivatives."""
+        velocity, bias = self.wheel_motion(sample, travel_rate) if motion is None else motion
+        acceleration = sample.tangent * travel_acceleration + bias
         return self._make_result(sample.position, velocity, acceleration, sample.jacobian, sample.condition)
 
     def solve(self, jounce, rack, *, normal=VERTICAL, normal_rate=ZERO_VECTOR, normal_acceleration=ZERO_VECTOR):

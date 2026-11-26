@@ -5,7 +5,8 @@ from tkinter import ttk
 
 from ._geometry_support.hardpoints import CORNERS
 from .dynamics_settings import (DRIVE_LIMITS, HEAVE_LIMITS, LATERAL_LIMITS, SIMULATION_LIMITS,
-                                validate_drive, validate_heave, validate_lateral)
+                                TEST_LIMITS, TEST_PRESETS, validate_drive,
+                                validate_heave, validate_lateral, validate_vehicle_test)
 
 
 TARGET_LABELS = {**dict(zip(CORNERS, CORNERS)), "all": "四輪"}
@@ -111,3 +112,52 @@ class DriveEditor(ttk.Frame):
         except ValueError as error:
             raise ValueError("馬達行駛欄位需要有效數值。") from error
         return validate_drive(settings)
+
+
+class VehicleTestEditor(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.preset_labels = {label: key for key, (label, _) in TEST_PRESETS.items()}
+        self.preset = tk.StringVar(self)
+        ttk.Label(self, text="測試工況").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        selector = ttk.Combobox(self, textvariable=self.preset, values=tuple(self.preset_labels),
+                                state="readonly", width=24)
+        selector.grid(row=0, column=1, sticky="w")
+        selector.bind("<<ComboboxSelected>>", self.show_fields)
+        self.inputs = ttk.Frame(self)
+        self.inputs.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.variables = {
+            preset: {key: tk.StringVar(self, value=str(value)) for key, value in defaults.items()}
+            for preset, (_, defaults) in TEST_PRESETS.items()
+        }
+        ttk.Label(self, text="沿用專案的馬達扭矩上限、滑移率控制、輪胎及空力設定。",
+                  wraplength=315).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    def show_fields(self, _event=None):
+        for child in self.inputs.winfo_children():
+            child.destroy()
+        fields = self.variables[self.preset_labels[self.preset.get()]]
+        for row, (key, variable) in enumerate(fields.items()):
+            if key == "road_class":
+                ttk.Label(self.inputs, text="ISO 路面級別").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+                ttk.Combobox(self.inputs, textvariable=variable, values=("A", "B", "C"),
+                             state="readonly", width=10).grid(row=row, column=1, sticky="w")
+            else:
+                add_entry(self.inputs, row, TEST_LIMITS[key][0], variable)
+
+    def populate(self, settings):
+        preset = settings["preset"]
+        for key, variable in self.variables[preset].items():
+            variable.set(str(settings[key]))
+        self.preset.set(TEST_PRESETS[preset][0])
+        self.show_fields()
+
+    def draft(self):
+        preset = self.preset_labels[self.preset.get()]
+        settings = {"preset": preset}
+        for key, variable in self.variables[preset].items():
+            try:
+                settings[key] = variable.get() if key == "road_class" else float(variable.get())
+            except ValueError as error:
+                raise ValueError(f"{TEST_LIMITS[key][0]}需要有效數值。") from error
+        return validate_vehicle_test(settings)

@@ -14,8 +14,8 @@ from .animation_controls import AnimationPlayer
 from .deformable import (DamperResult, DynamicsModel, build_dynamics_model, sample_dampers,
                          sample_element_springs, with_axle_pushrod_mounts)
 from .deformable_controls import DeformableEditor
-from .dynamics_controls import DriveEditor, HeaveEditor, LateralEditor, RoadEditor, TARGET_LABELS
-from .dynamics_settings import INERTIA_LIMITS
+from .dynamics_controls import DriveEditor, HeaveEditor, LateralEditor, RoadEditor, TARGET_LABELS, VehicleTestEditor
+from .dynamics_settings import AERO_FIELDS, INERTIA_LIMITS, TEST_PRESETS
 from .element_editor import ElementEditor
 from .elements import DAMPER_POINT, DEFORMABLE_KINDS, PUSH_ROD, default_elements
 from .geometry import LINKS, POINTS, VehicleGeometry, build_vehicle, static_geometry
@@ -26,7 +26,8 @@ from .hardpoint_import import import_hardpoint_csv
 from .heave import simulate_heave
 from .project import (COMPONENTS, DRIVERS, default_project, read_project,
                       save_project, validate)
-from .rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road
+from .maneuvers import COAST_STOP_SPEED
+from .rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road, simulate_vehicle_test
 from .signal_plot import MOUNT_LABELS, SignalView
 from .solver import Unreachable, VehicleResult, solve_vehicle
 from .vehicle_telemetry import VehicleTelemetryView, vehicle_readings
@@ -47,6 +48,7 @@ RUN_EDITORS = {
     "heave": ("heave", "重心 Heave", HeaveEditor),
     "lateral": ("lateral", "重心側向力", LateralEditor),
     "drive": ("drive", "馬達行駛", DriveEditor),
+    "vehicle_test": ("vehicle_test", "車輛測試", VehicleTestEditor),
 }
 
 
@@ -107,6 +109,8 @@ def solve_run_job(results, model, data, mode):
             frames = simulate_rigid_lateral(model, data["dynamics"], data["geometry"]["vehicle"]["mass"])
         elif mode == "drive":
             frames = simulate_rigid_drive(model, data["dynamics"], data["geometry"]["vehicle"]["mass"])
+        elif mode == "vehicle_test":
+            frames = simulate_vehicle_test(model, data["dynamics"], data["geometry"]["vehicle"]["mass"])
         else:
             raise ValueError(f"未知的模擬模式：{mode}")
     except Exception as error:
@@ -400,6 +404,13 @@ class Workbench(ttk.Frame):
                 self.fields["geometry", "vehicle", key] = self.new_variable()
             else:
                 self.field(vehicle.content, ("geometry", "vehicle", key), label, unit)
+
+        aero = ttk.Frame(notebook, padding=6)
+        notebook.add(aero, text="空力")
+        for key, (label, unit, _, _) in AERO_FIELDS.items():
+            self.field(aero, ("aero", "chassis", key), label, unit)
+        ttk.Label(aero, text="適用於馬達行駛。前軸空力平衡決定壓力中心在前後軸之間的位置。面積填 0 可停用對應的力。",
+                  wraplength=300, padding=(8, 8)).pack(anchor="w")
 
         points = ttk.Frame(notebook, padding=6)
         self.hardpoint_tab = points
@@ -702,6 +713,8 @@ class Workbench(ttk.Frame):
         inertia = {key: self.number(("inertia", "chassis", key), label)
                    for key, (label, _, _) in INERTIA_LIMITS.items()}
         dynamics = data["dynamics"]
+        dynamics["aero"] = {key: self.number(("aero", "chassis", key), label)
+                            for key, (label, _, _, _) in AERO_FIELDS.items()}
         for corner, values in dynamics["corners"].items():
             values["mass_kg"] = self.number(("mass", corner, "mass_kg"), f"{corner} 輪端質量")
         try:
@@ -809,6 +822,8 @@ class Workbench(ttk.Frame):
                     value = geometry[channel][field]
                 elif group == "inertia":
                     value = self.data["dynamics"]["chassis_inertia"][field]
+                elif group == "aero":
+                    value = dynamics["aero"][field]
                 elif group == "mass":
                     value = dynamics["corners"][channel][field]
                 var.set(str(value))
@@ -934,7 +949,8 @@ class Workbench(ttk.Frame):
         messages = {"heave": "正在解算車身與四輪的垂直運動…",
                     "road": "正在解算路面擾動下的車身平移、轉動與輪端運動…",
                     "lateral": "正在解算重心側向力下的車身姿態與輪端運動…",
-                    "drive": "正在聯立馬達、輪胎與車身運動…"}
+                    "drive": "正在聯立馬達、輪胎與車身運動…",
+                    "vehicle_test": "正在計算車輛測試與四輪響應…"}
         self.status.set(messages[mode])
         job, revision = self.animation_job, self.revision
         Thread(target=solve_run_job, args=(job, prepared.dynamics, data, mode), daemon=True).start()
@@ -964,6 +980,18 @@ class Workbench(ttk.Frame):
             label = "重心側向力"
         elif mode == "drive":
             label = "馬達行駛 · Pacejka"
+        elif mode == "vehicle_test":
+            test = data["dynamics"]["vehicle_test"]
+            label = TEST_PRESETS[test["preset"]][0]
+            if test["preset"] == "iso_road":
+                label += f" · {test['road_class']} 級"
+            if test["preset"] == "coast":
+                final = frames[-1]
+                speed = final.body.planar_speed
+                if speed <= COAST_STOP_SPEED:
+                    self.status.set(f"滑行於 {final.time:.2f} s 達到停止判定。")
+                else:
+                    self.status.set(f"已達模擬時間上限，車速仍為 {speed:.2f} m/s。")
         else:
             target = TARGET_LABELS[data["dynamics"]["simulation"]["target"]]
             label = f"路面擾動 · {target}"

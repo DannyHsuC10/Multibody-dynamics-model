@@ -6,10 +6,12 @@ import numpy as np
 
 from MultibodyGeometryLab.deformable import build_dynamics_model
 from MultibodyGeometryLab.driving import DriveModel
-from MultibodyGeometryLab.dynamics_settings import validate_drive
+from MultibodyGeometryLab.dynamics_settings import default_aero, validate_drive
 from MultibodyGeometryLab.geometry import FIXED, POINTS, build_vehicle
 from MultibodyGeometryLab.project import default_project
-from MultibodyGeometryLab.rigid_body import simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road
+from MultibodyGeometryLab.rigid_body import (
+    _RigidChassisEquation, simulate_rigid_drive, simulate_rigid_lateral, simulate_rigid_road,
+)
 
 
 INERTIA = {"ixx": 55., "iyy": 95., "izz": 125.}
@@ -176,6 +178,33 @@ class RigidBodyTests(unittest.TestCase):
                 _, _, sample, _ = drive.contact(time, wheel_speed, axes, hub_velocity, normal_load)
                 np.testing.assert_allclose(sample.slip_ratio, slip)
                 np.testing.assert_allclose(sample.motor_torque_by_wheel_nm, torque, atol=1e-10)
+
+    def test_aero_adds_body_force_and_moment_about_sprung_cg(self):
+        aero = {**default_aero(), "drag_area_m2": .7, "downforce_area_m2": 1.8,
+                "front_balance_percent": 70., "pressure_center_height_m": .55}
+        drive = {**self.settings["drive"], "steer_deg": 0.}
+        inertia = np.array(list(INERTIA.values()))
+        args = (self.model, self.vehicle["mass"], inertia, "all", 0., .25)
+        baseline = _RigidChassisEquation(*args, drive_settings=drive)
+        loaded = _RigidChassisEquation(*args, drive_settings=drive, aero_settings=aero)
+        state = np.zeros(25)
+        state[3] = 1.
+        rest = loaded.evaluate(state, 0.)
+        self.assertEqual((rest.aero_drag, rest.aero_downforce), (0., 0.))
+        state[7:9] = (12., 5.)
+        state[21:] = 12. / loaded.drive.radius
+        without, with_aero = baseline.evaluate(state, 0.), loaded.evaluate(state, 0.)
+        pressure = .5 * aero["air_density_kg_m3"] * 13.**2
+        self.assertAlmostEqual(with_aero.aero_drag, pressure * .7)
+        self.assertAlmostEqual(with_aero.aero_downforce, pressure * 1.8)
+        force = pressure * np.array([-.7 * 12. / 13., -.7 * 5. / 13., -1.8])
+        hubs = np.array([path.position[HUB] for path in with_aero.paths])
+        center = np.array([.7 * hubs[:2, 0].mean() + .3 * hubs[2:, 0].mean(), 0., .55])
+        axle_force_delta = loaded.masses[:, None] * (with_aero.hub_accelerations - without.hub_accelerations)
+        accel_delta = with_aero.acceleration - without.acceleration
+        np.testing.assert_allclose(loaded.body_mass * accel_delta[:3] + axle_force_delta.sum(axis=0), force)
+        np.testing.assert_allclose(inertia * accel_delta[3:6] + np.cross(hubs - loaded.pivot, axle_force_delta).sum(axis=0),
+                                   np.cross(center - loaded.pivot, force))
 
 
 if __name__ == "__main__":

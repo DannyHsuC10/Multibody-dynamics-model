@@ -248,7 +248,7 @@ def network_response(geometry, samples, speeds=None):
     return forces, stiffness, None
 
 
-def coupled_terms(geometry, paths, speeds):
+def coupled_terms(geometry, paths, speeds, *, velocities=None):
     """Return axial forces and absolute stiffness/damping row bounds by wheel."""
     if not geometry.rocker_dampers:
         return {}
@@ -262,6 +262,12 @@ def coupled_terms(geometry, paths, speeds):
     ratios = np.array([length_gradient(damper, sample, names)
                        for damper, sample in zip(geometry.rocker_dampers, samples)])
     axial_speeds = ratios @ wheel_rates
+    if velocities is not None:
+        motion = {name: (path.position, velocity, np.zeros_like(velocity))
+                  for name, path, velocity in zip(names, paths, velocities)}
+        rocker_motion = {corner.name: corner.rocker.state(*motion[corner.name])
+                         for corner in geometry.corners if corner.rocker is not None}
+        axial_speeds = np.array([damper.sample(rocker_motion, motion).speed for damper in geometry.rocker_dampers])
     network_forces, network_stiffness, network_damping = network_response(geometry, samples, axial_speeds)
     speed_gradients = []
     for damper, sample, ratio, speed, hydraulic in zip(

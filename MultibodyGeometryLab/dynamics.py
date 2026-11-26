@@ -127,8 +127,11 @@ def sample_times(duration, *checkpoints):
     steps = ceil(duration * FRAMES_PER_SECOND)
     times = list(np.linspace(0., duration, steps + 1))
     for sample in checkpoints:
-        if not any(abs(time - sample) < 1e-10 for time in times):
+        nearest = next((index for index, time in enumerate(times) if abs(time - sample) < 1e-10), None)
+        if nearest is None or (nearest in (0, steps) and sample != times[nearest]):
             times.append(sample)
+        else:
+            times[nearest] = sample
     return sorted(times)
 
 

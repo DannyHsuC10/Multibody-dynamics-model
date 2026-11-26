@@ -22,6 +22,10 @@ class DriveSample:
     fy: np.ndarray
     slip_ratio: np.ndarray
     slip_angle_deg: np.ndarray
+    test_torque_request_nm: float | None = None
+    test_steer_deg: float | None = None
+    test_target_speed_m_s: float | None = None
+    rolling_torque_nm: np.ndarray | None = None
 
     @property
     def motor_torque_nm(self):
@@ -32,9 +36,9 @@ class DriveSample:
         return float(np.mean(self.motor_rpm_by_wheel))
 
 
-def steering_rack(solvers, target_deg):
+def steering_rack(solvers, target_deg, *, calibrate_zero=False):
     """Calibrate one fixed rack displacement to the mean front toe at static ride height."""
-    if target_deg == 0.:
+    if target_deg == 0. and not calibrate_zero:
         return 0.
 
     def mean_toe(rack):
@@ -91,7 +95,7 @@ class DriveModel:
     def get_motor_torque_data(self, rpm):
         return np.interp(abs(rpm), self.rpm, self.torque_limit, right=0.)
 
-    def contact(self, time, wheel_speed, axes, hub_velocity, normal_load):
+    def contact(self, time, wheel_speed, axes, hub_velocity, normal_load, *, command=None, rolling_resistance=0.):
         forward = np.column_stack((axes[:, 1], -axes[:, 0], np.zeros(len(axes))))
         forward /= np.linalg.norm(forward, axis=1)[:, None]
         lateral = np.column_stack((-forward[:, 1], forward[:, 0], forward[:, 2]))
@@ -117,19 +121,27 @@ class DriveModel:
         fy = self.api.calculate_fy(condition) * self.mirror * contact_scale
         rpm = np.abs(wheel_speed) * self.train_rate * 60 / (2 * np.pi)
         torque_limit = self.get_motor_torque_data(rpm)
-        throttle_ramp = ramp_force(time, 1., THROTTLE_RAMP_SECONDS)
+        throttle_ramp = ramp_force(time, 1., THROTTLE_RAMP_SECONDS) if command is None else 1.
+        requested_limit = self.command_limit if command is None else max(command, 0.)
         torque_request = self.slip_kp * (self.target_slip_ratio - kappa)
-        torque = np.minimum(throttle_ramp * np.clip(torque_request, 0., self.command_limit), torque_limit)
+        torque = np.minimum(throttle_ramp * np.clip(torque_request, 0., requested_limit), torque_limit)
+        if command is not None and command < 0.:
+            torque = -np.minimum(-command, torque_limit)
         wheel_torque = torque * self.train_rate * self.gear_eta
-        wheel_acceleration = (wheel_torque - self.radius * fx) / self.inertia
+        wheel_net_torque = wheel_torque - self.radius * fx
+        loss = None
+        if rolling_resistance:
+            loss = self.radius * normal_load * rolling_resistance * np.tanh(rolling / .2)
+            wheel_net_torque -= loss
+        wheel_acceleration = wheel_net_torque / self.inertia
         horizontal = fx[:, None] * forward + fy[:, None] * lateral
         spin_rate = self.slip_stiffness * (normal_load / p["FNOMIN"]) * self.radius**2 / (self.inertia * slip_speed)
         # The proportional term adds stiffness where the torque command is unsaturated.
-        feedback_active = ((torque_request >= 0.) & (torque_request <= self.command_limit)
-                           & (torque < torque_limit) & (self.command_limit > 0.))
+        feedback_active = ((torque_request >= 0.) & (torque_request <= requested_limit)
+                           & (torque < torque_limit) & (requested_limit > 0.))
         spin_rate += (feedback_active * throttle_ramp * self.slip_kp * self.train_rate
                       * self.gear_eta * self.radius / (self.inertia * slip_speed))
         step_limit = min(.002, 1. / max(float(np.max(spin_rate)), 1.))
         sample = DriveSample(torque, rpm, wheel_torque, wheel_speed.copy(),
-                             fx, fy, kappa, np.degrees(alpha))
+                             fx, fy, kappa, np.degrees(alpha), rolling_torque_nm=loss)
         return horizontal, wheel_acceleration, sample, step_limit

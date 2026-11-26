@@ -36,6 +36,13 @@ INERTIA_LIMITS = {
     "iyy": ("Iyy · 俯仰", .01, 1_000_000.),
     "izz": ("Izz · 偏航", .01, 1_000_000.),
 }
+AERO_FIELDS = {
+    "air_density_kg_m3": ("空氣密度", "kg/m³", .1, 2.),
+    "drag_area_m2": ("阻力面積 CdA", "m²", 0., 10.),
+    "downforce_area_m2": ("下壓力面積 ClA", "m²", 0., 20.),
+    "front_balance_percent": ("前軸空力平衡", "%", 0., 100.),
+    "pressure_center_height_m": ("壓力中心離地高", "m", 0., 3.),
+}
 DRIVE_LIMITS = {
     "torque_nm": ("每顆馬達扭矩上限 (N·m)", 0., 1000.),
     "target_slip_ratio": ("目標縱向滑移率（0.12 = 12%）", .01, .5),
@@ -48,6 +55,56 @@ DRIVE_LIMITS = {
     "duration_seconds": ("模擬時間 (s)", .5, 12.),
 }
 DEFAULT_SLIP_CONTROL = {"target_slip_ratio": .12, "slip_kp": 400.}
+TEST_LIMITS = {
+    "speed_m_s": ("車速 (m/s)", .5, 30.),
+    "start_seconds": ("輸入開始時間 (s)", 0., 30.),
+    "duration_seconds": ("模擬時間上限 (s)", .5, 120.),
+    "steer_deg": ("前輪平均轉角 (°)", -25., 25.),
+    "rise_seconds": ("轉向時間 (s)", .2, 20.),
+    "frequency_hz": ("轉向頻率 (Hz)", .05, 3.),
+    "throttle_percent": ("油門開度 (%)", 0., 100.),
+    "rolling_resistance": ("滾動阻力係數", .005, .1),
+    "radius_m": ("目標圓半徑 (m)", 4., 200.),
+    "road_seed": ("路面種子", 0., 2**32 - 1),
+}
+TEST_PRESETS = {
+    "steer_step": ("1. 定速轉向躍階", dict(speed_m_s=8., start_seconds=1., steer_deg=4., duration_seconds=5.)),
+    "steer_ramp": ("2. 定速轉向漸增", dict(speed_m_s=8., start_seconds=1., steer_deg=8., rise_seconds=3.,
+                                      duration_seconds=6.)),
+    "coast": ("3. 鬆油門滑行至停止", dict(speed_m_s=5., rolling_resistance=.025, duration_seconds=40.)),
+    "steer_sine": ("4. 定速正弦轉向", dict(speed_m_s=8., start_seconds=1., steer_deg=4., frequency_hz=.5,
+                                      duration_seconds=6.)),
+    "throttle_step": ("5. 起步油門躍階", dict(start_seconds=.5, throttle_percent=60., duration_seconds=4.)),
+    "cruise_step": ("6. 定速後油門躍階", dict(speed_m_s=8., start_seconds=2., throttle_percent=80.,
+                                        duration_seconds=5.)),
+    "acceleration": ("7. 直線加速", dict(throttle_percent=100., duration_seconds=6.)),
+    "circle": ("8. 定圓測試", dict(speed_m_s=7., radius_m=25., rise_seconds=1., duration_seconds=10.)),
+    "iso_road": ("9. ISO 8608 路面", dict(speed_m_s=8., road_class="A", road_seed=1., duration_seconds=6.)),
+}
+
+
+def default_vehicle_test(preset="steer_step"):
+    return {"preset": preset, **TEST_PRESETS[preset][1]}
+
+
+def validate_vehicle_test(data):
+    preset = data.get("preset") if isinstance(data, dict) else None
+    if not isinstance(preset, str) or preset not in TEST_PRESETS:
+        raise ValueError("請選擇車輛測試工況。")
+    require_fields(data, default_vehicle_test(preset), "車輛測試設定")
+    result = {"preset": preset}
+    for key, value in data.items():
+        if key in TEST_LIMITS:
+            result[key] = bounded(value, *TEST_LIMITS[key])
+    if "start_seconds" in result and result["start_seconds"] >= result["duration_seconds"]:
+        raise ValueError("輸入開始時間須早於模擬結束時間。")
+    if "rise_seconds" in result and result.get("start_seconds", 0.) + result["rise_seconds"] > result["duration_seconds"]:
+        raise ValueError("模擬時間須涵蓋完整的轉向輸入。")
+    if preset == "iso_road":
+        if data["road_class"] not in ("A", "B", "C") or not result["road_seed"].is_integer():
+            raise ValueError("ISO 路面須選擇 A、B 或 C 級，並填入整數種子。")
+        result.update(road_class=data["road_class"], road_seed=int(result["road_seed"]))
+    return result
 
 
 def default_drive():
@@ -65,6 +122,17 @@ def validate_drive(data):
 
 def default_chassis_inertia():
     return {"ixx": 55., "iyy": 95., "izz": 125.}
+
+
+def default_aero():
+    return {"air_density_kg_m3": 1.225, "drag_area_m2": 0., "downforce_area_m2": 0.,
+            "front_balance_percent": 50., "pressure_center_height_m": .3}
+
+
+def validate_aero(data):
+    require_fields(data, AERO_FIELDS, "空力設定")
+    return {key: bounded(data[key], f"{label} ({unit})", low, high)
+            for key, (label, unit, low, high) in AERO_FIELDS.items()}
 
 
 def default_heave():
@@ -90,6 +158,8 @@ def default_dynamics():
         "heave": default_heave(),
         "lateral": default_lateral(),
         "drive": default_drive(),
+        "aero": default_aero(),
+        "vehicle_test": default_vehicle_test(),
         "chassis_inertia": default_chassis_inertia(),
     }
 
@@ -164,10 +234,12 @@ def _validate_legacy_mount(corner, values):
 
 
 def validate_dynamics(data):
-    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "lateral", "chassis_inertia", "drive")
+    fields = ("corners", "tire_damping_ns_m", "simulation", "heave", "lateral", "chassis_inertia",
+              "drive", "aero", "vehicle_test")
     if isinstance(data, dict):
         data = {"heave": default_heave(), "lateral": default_lateral(), "drive": default_drive(),
-                "chassis_inertia": default_chassis_inertia(), **data}
+                "chassis_inertia": default_chassis_inertia(), "aero": default_aero(),
+                "vehicle_test": default_vehicle_test(), **data}
     mounts = None
     if isinstance(data, dict) and "pushrod_mounts" in data:
         fields = (*fields, "pushrod_mounts")
@@ -207,6 +279,8 @@ def validate_dynamics(data):
                 "simulation": {"target": simulation["target"], **inputs}, "heave": validate_heave(data["heave"]),
                 "lateral": validate_lateral(data["lateral"]),
                 "drive": validate_drive(data["drive"]),
+                "aero": validate_aero(data["aero"]),
+                "vehicle_test": validate_vehicle_test(data["vehicle_test"]),
                 "chassis_inertia": validate_chassis_inertia(data["chassis_inertia"])}
     if mounts is not None:
         settings["pushrod_mounts"] = mounts

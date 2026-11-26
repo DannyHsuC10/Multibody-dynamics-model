@@ -435,16 +435,17 @@ def build_dynamics_model(geometry: VehicleGeometry, vehicle_settings, dynamics_s
                          unbalanced)
 
 
-def suspension_terms(model, name, path, speed):
+def suspension_terms(model, name, path, speed, *, velocity=None):
     """Return generalized spring force plus tangent stiffness and damping bounds."""
     specs = (model.corners[name],) if model.elastic_members is None else model.elastic_members[name]
     generalized_force = stiffness = damping = 0.
     for spec in specs:
         try:
             length, ratio, curvature = spec.kinematics(path.position, path.tangent, path.curvature)
+            axial_speed = ratio * speed if velocity is None else spec.kinematics(path.position, velocity)[1]
         except Unreachable as error:
             raise Unreachable(f"{name} · {error}") from error
-        force = spec.spring_force(length) + spec.damping_force(ratio * speed)
+        force = spec.spring_force(length) + spec.damping_force(axial_speed)
         generalized_force += force * ratio
         stiffness += (spec.stiffness * ratio**2 + abs(force * curvature)
                       + 2 * spec.damping * abs(ratio * curvature * speed))
